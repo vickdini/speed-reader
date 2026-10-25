@@ -113,7 +113,7 @@ pub fn strip_html_tags(html: &str) -> String {
                 if tag_name == "p" || tag_name == "div" || tag_name == "h1" || tag_name == "h2" 
                    || tag_name == "h3" || tag_name == "h4" || tag_name == "h5" || tag_name == "h6" 
                    || tag_name == "li" || tag_name == "tr" {
-                    result.push('\n');
+                    result.push_str("\n\n");
                 } else if tag_name == "br" {
                     result.push('\n');
                 }

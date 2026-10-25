@@ -14,6 +14,7 @@ pub struct SpeedReaderApp {
     pub document: Document,
     pub word_index: usize,
     pub line_index: usize,
+    pub paragraph_index: usize,
     pub is_playing: bool,
     pub last_tick: Instant,
     pub step_duration_ms: f32,
@@ -36,6 +37,7 @@ impl SpeedReaderApp {
         let mut document = Document::demo_document(config.words_per_line);
         let mut word_idx = 0;
         let mut line_idx = 0;
+        let mut para_idx = 0;
 
         if let Some(recent) = config.recent_books.first().cloned() {
             if recent.file_path.exists() {
@@ -48,6 +50,11 @@ impl SpeedReaderApp {
                     );
                     word_idx = recent.word_index.min(document.total_words.saturating_sub(1));
                     line_idx = recent.line_index.min(document.total_lines.saturating_sub(1));
+                    para_idx = if recent.paragraph_index < document.total_paragraphs {
+                        recent.paragraph_index
+                    } else {
+                        document.paragraph_for_word(word_idx)
+                    };
                     config.wpm = recent.wpm;
                     config.active_mode = recent.mode;
                 }
@@ -59,6 +66,7 @@ impl SpeedReaderApp {
             document,
             word_index: word_idx,
             line_index: line_idx,
+            paragraph_index: para_idx,
             is_playing: false,
             last_tick: Instant::now(),
             step_duration_ms: 250.0,
@@ -97,6 +105,11 @@ impl SpeedReaderApp {
                 if let Some(bm) = bookmark {
                     self.word_index = bm.word_index.min(self.document.total_words.saturating_sub(1));
                     self.line_index = bm.line_index.min(self.document.total_lines.saturating_sub(1));
+                    self.paragraph_index = if bm.paragraph_index < self.document.total_paragraphs {
+                        bm.paragraph_index
+                    } else {
+                        self.document.paragraph_for_word(self.word_index)
+                    };
                     self.config.wpm = bm.wpm;
                     self.config.active_mode = bm.mode;
                     self.set_status(format!(
@@ -109,6 +122,7 @@ impl SpeedReaderApp {
                 } else {
                     self.word_index = 0;
                     self.line_index = 0;
+                    self.paragraph_index = 0;
                     self.set_status(format!(
                         "Loaded '{}' ({} {}, {} words)",
                         title,
@@ -133,8 +147,10 @@ impl SpeedReaderApp {
                 &self.document.title,
                 self.word_index,
                 self.line_index,
+                self.paragraph_index,
                 self.document.total_words,
                 self.document.total_lines,
+                self.document.total_paragraphs,
                 self.config.wpm,
                 self.config.active_mode,
             );
@@ -155,6 +171,7 @@ impl SpeedReaderApp {
         if let Some(sec) = self.document.sections.get(section_idx) {
             self.word_index = sec.start_word_index;
             self.line_index = sec.start_line_index;
+            self.paragraph_index = sec.start_paragraph_index;
             self.is_playing = false;
             self.set_status(format!("Jumped to {}", sec.title));
             self.save_current_bookmark();
@@ -229,6 +246,13 @@ impl SpeedReaderApp {
                     (self.line_index as f32 / self.document.total_lines as f32) * 100.0
                 }
             }
+            ReadingMode::Paragraph => {
+                if self.document.total_paragraphs == 0 {
+                    0.0
+                } else {
+                    (self.paragraph_index as f32 / self.document.total_paragraphs as f32) * 100.0
+                }
+            }
             ReadingMode::WordRsvp => {
                 (self.word_index as f32 / self.document.total_words as f32) * 100.0
             }
@@ -255,6 +279,22 @@ impl SpeedReaderApp {
         self.document.lines.get(self.line_index + 1)
     }
 
+    pub fn current_paragraph(&self) -> Option<&crate::reader::ReadingParagraph> {
+        self.document.paragraphs.get(self.paragraph_index)
+    }
+
+    pub fn prev_paragraph(&self) -> Option<&crate::reader::ReadingParagraph> {
+        if self.paragraph_index > 0 {
+            self.document.paragraphs.get(self.paragraph_index - 1)
+        } else {
+            None
+        }
+    }
+
+    pub fn next_paragraph(&self) -> Option<&crate::reader::ReadingParagraph> {
+        self.document.paragraphs.get(self.paragraph_index + 1)
+    }
+
     pub fn calculate_step_duration(&self) -> f32 {
         let base_word_ms = 60_000.0 / (self.config.wpm as f32).max(50.0);
         match self.config.active_mode {
@@ -279,6 +319,19 @@ impl SpeedReaderApp {
                     base_word_ms * 6.0
                 }
             }
+            ReadingMode::Paragraph => {
+                if let Some(para) = self.current_paragraph() {
+                    let word_count = (para.word_indices.end - para.word_indices.start).max(1) as f32;
+                    let multiplier = if self.config.smart_pause {
+                        para.pause_multiplier
+                    } else {
+                        1.0
+                    };
+                    base_word_ms * word_count * multiplier
+                } else {
+                    base_word_ms * 30.0
+                }
+            }
         }
     }
 
@@ -288,6 +341,17 @@ impl SpeedReaderApp {
                 if self.line_index + 1 < self.document.total_lines {
                     self.line_index += 1;
                     self.word_index = self.document.word_for_line(self.line_index);
+                    self.paragraph_index = self.document.paragraph_for_word(self.word_index);
+                } else {
+                    self.is_playing = false;
+                    self.set_status("Reached end of book");
+                }
+            }
+            ReadingMode::Paragraph => {
+                if self.paragraph_index + 1 < self.document.total_paragraphs {
+                    self.paragraph_index += 1;
+                    self.word_index = self.document.word_for_paragraph(self.paragraph_index);
+                    self.line_index = self.document.line_for_paragraph(self.paragraph_index);
                 } else {
                     self.is_playing = false;
                     self.set_status("Reached end of book");
@@ -297,6 +361,7 @@ impl SpeedReaderApp {
                 if self.word_index + 1 < self.document.total_words {
                     self.word_index += 1;
                     self.line_index = self.document.line_for_word(self.word_index);
+                    self.paragraph_index = self.document.paragraph_for_word(self.word_index);
                 } else {
                     self.is_playing = false;
                     self.set_status("Reached end of book");
@@ -311,12 +376,21 @@ impl SpeedReaderApp {
                 if self.line_index > 0 {
                     self.line_index -= 1;
                     self.word_index = self.document.word_for_line(self.line_index);
+                    self.paragraph_index = self.document.paragraph_for_word(self.word_index);
+                }
+            }
+            ReadingMode::Paragraph => {
+                if self.paragraph_index > 0 {
+                    self.paragraph_index -= 1;
+                    self.word_index = self.document.word_for_paragraph(self.paragraph_index);
+                    self.line_index = self.document.line_for_paragraph(self.paragraph_index);
                 }
             }
             ReadingMode::WordRsvp => {
                 if self.word_index > 0 {
                     self.word_index -= 1;
                     self.line_index = self.document.line_for_word(self.word_index);
+                    self.paragraph_index = self.document.paragraph_for_word(self.word_index);
                 }
             }
         }
@@ -330,6 +404,15 @@ impl SpeedReaderApp {
                     .min(self.document.total_lines.saturating_sub(1) as isize) as usize;
                 self.line_index = new_idx;
                 self.word_index = self.document.word_for_line(new_idx);
+                self.paragraph_index = self.document.paragraph_for_word(self.word_index);
+            }
+            ReadingMode::Paragraph => {
+                let new_idx = (self.paragraph_index as isize + count)
+                    .max(0)
+                    .min(self.document.total_paragraphs.saturating_sub(1) as isize) as usize;
+                self.paragraph_index = new_idx;
+                self.word_index = self.document.word_for_paragraph(new_idx);
+                self.line_index = self.document.line_for_paragraph(new_idx);
             }
             ReadingMode::WordRsvp => {
                 let new_idx = (self.word_index as isize + count)
@@ -337,6 +420,7 @@ impl SpeedReaderApp {
                     .min(self.document.total_words.saturating_sub(1) as isize) as usize;
                 self.word_index = new_idx;
                 self.line_index = self.document.line_for_word(new_idx);
+                self.paragraph_index = self.document.paragraph_for_word(self.word_index);
             }
         }
     }
@@ -348,11 +432,19 @@ impl SpeedReaderApp {
                 let target = ((self.document.total_lines as f32) * clamped).floor() as usize;
                 self.line_index = target.min(self.document.total_lines.saturating_sub(1));
                 self.word_index = self.document.word_for_line(self.line_index);
+                self.paragraph_index = self.document.paragraph_for_word(self.word_index);
+            }
+            ReadingMode::Paragraph => {
+                let target = ((self.document.total_paragraphs as f32) * clamped).floor() as usize;
+                self.paragraph_index = target.min(self.document.total_paragraphs.saturating_sub(1));
+                self.word_index = self.document.word_for_paragraph(self.paragraph_index);
+                self.line_index = self.document.line_for_paragraph(self.paragraph_index);
             }
             ReadingMode::WordRsvp => {
                 let target = ((self.document.total_words as f32) * clamped).floor() as usize;
                 self.word_index = target.min(self.document.total_words.saturating_sub(1));
                 self.line_index = self.document.line_for_word(self.word_index);
+                self.paragraph_index = self.document.paragraph_for_word(self.word_index);
             }
         }
     }
@@ -379,12 +471,14 @@ impl SpeedReaderApp {
                 );
                 self.word_index = cur_word.min(self.document.total_words.saturating_sub(1));
                 self.line_index = self.document.line_for_word(self.word_index);
+                self.paragraph_index = self.document.paragraph_for_word(self.word_index);
             }
         } else {
             let cur_word = self.word_index;
             self.document = Document::demo_document(self.config.words_per_line);
             self.word_index = cur_word.min(self.document.total_words.saturating_sub(1));
             self.line_index = self.document.line_for_word(self.word_index);
+            self.paragraph_index = self.document.paragraph_for_word(self.word_index);
         }
     }
 
@@ -533,13 +627,15 @@ impl eframe::App for SpeedReaderApp {
         }
         if key_m {
             self.config.active_mode = match self.config.active_mode {
-                ReadingMode::Line => ReadingMode::WordRsvp,
+                ReadingMode::Line => ReadingMode::Paragraph,
+                ReadingMode::Paragraph => ReadingMode::WordRsvp,
                 ReadingMode::WordRsvp => ReadingMode::Line,
             };
             self.set_status(format!(
                 "Mode: {}",
                 match self.config.active_mode {
                     ReadingMode::Line => "Line-by-Line",
+                    ReadingMode::Paragraph => "Paragraph",
                     ReadingMode::WordRsvp => "Word RSVP",
                 }
             ));
@@ -548,6 +644,7 @@ impl eframe::App for SpeedReaderApp {
         if key_r {
             self.word_index = 0;
             self.line_index = 0;
+            self.paragraph_index = 0;
             self.set_status("Rewound to start");
         }
         if key_p {
@@ -706,10 +803,15 @@ impl eframe::App for SpeedReaderApp {
                             // Mode Switcher Buttons
                             ui.horizontal(|ui| {
                                 let line_active = self.config.active_mode == ReadingMode::Line;
+                                let para_active = self.config.active_mode == ReadingMode::Paragraph;
                                 let rsvp_active = self.config.active_mode == ReadingMode::WordRsvp;
 
-                                if ui.selectable_label(line_active, "≡ Line Mode").clicked() {
+                                if ui.selectable_label(line_active, "≡ Line").clicked() {
                                     self.config.active_mode = ReadingMode::Line;
+                                    self.config.save();
+                                }
+                                if ui.selectable_label(para_active, "¶ Paragraph").clicked() {
+                                    self.config.active_mode = ReadingMode::Paragraph;
                                     self.config.save();
                                 }
                                 if ui.selectable_label(rsvp_active, "✦ Word RSVP").clicked() {
@@ -745,6 +847,7 @@ impl eframe::App for SpeedReaderApp {
                             let sec_type = self.document.section_type_label();
                             let stats_text = match self.config.active_mode {
                                 ReadingMode::Line => format!("{}/{} lines | {} {}/{}", self.line_index + 1, self.document.total_lines, sec_type, cur_sec_idx + 1, self.document.sections.len()),
+                                ReadingMode::Paragraph => format!("{}/{} paragraphs | {} {}/{}", self.paragraph_index + 1, self.document.total_paragraphs, sec_type, cur_sec_idx + 1, self.document.sections.len()),
                                 ReadingMode::WordRsvp => format!("{}/{} words | {} {}/{}", self.word_index + 1, self.document.total_words, sec_type, cur_sec_idx + 1, self.document.sections.len()),
                             };
                             ui.label(RichText::new(stats_text).color(colors.text_secondary).size(11.0));
@@ -1035,7 +1138,11 @@ impl eframe::App for SpeedReaderApp {
                                             let path_str = book.file_path.to_string_lossy();
                                             ui.label(RichText::new(truncate_str(&path_str, 55)).color(colors.text_faint).size(11.0));
 
-                                            let stats = format!("{:.1}% read (word {} of {})", pct, book.word_index + 1, book.total_words);
+                                            let stats = match book.mode {
+                                                ReadingMode::Paragraph => format!("{:.1}% read (para {} of {}, {} words)", pct, book.paragraph_index + 1, book.total_paragraphs, book.total_words),
+                                                ReadingMode::Line => format!("{:.1}% read (line {} of {}, {} words)", pct, book.line_index + 1, book.total_lines, book.total_words),
+                                                ReadingMode::WordRsvp => format!("{:.1}% read (word {} of {})", pct, book.word_index + 1, book.total_words),
+                                            };
                                             ui.label(RichText::new(stats).color(colors.text_secondary).size(11.0));
                                         });
 
@@ -1141,12 +1248,12 @@ impl eframe::App for SpeedReaderApp {
                         ("Space", "Play / Pause"),
                         ("← / H", "Step Back"),
                         ("→ / L", "Step Forward"),
-                        ("Shift + ←/→", "Jump 10 Words/Lines"),
+                        ("Shift + ←/→", "Jump 10 Words/Lines/Paras"),
                         ("[ / ]", "Prev / Next Chapter or Page"),
                         ("P", "Select Chapter / Page"),
                         ("B", "Manage Library & History"),
                         ("↑ / ↓", "+25 / -25 WPM Speed"),
-                        ("M", "Toggle Line / RSVP Mode"),
+                        ("M", "Cycle Line / Paragraph / RSVP"),
                         ("F / F11", "Toggle Zen Focus Mode"),
                         ("R", "Rewind to Start"),
                         ("Esc", "Close Modals / Exit Zen"),
@@ -1170,6 +1277,9 @@ impl eframe::App for SpeedReaderApp {
                 match self.config.active_mode {
                     ReadingMode::Line => {
                         self.render_line_mode(ui, rect, center, &colors);
+                    }
+                    ReadingMode::Paragraph => {
+                        self.render_paragraph_mode(ui, rect, center, &colors);
                     }
                     ReadingMode::WordRsvp => {
                         self.render_rsvp_mode(ui, rect, center, &colors);
@@ -1257,6 +1367,145 @@ impl SpeedReaderApp {
                     colors.text_faint,
                 );
             }
+        }
+    }
+
+    fn render_paragraph_mode(&mut self, ui: &mut egui::Ui, rect: egui::Rect, center: egui::Pos2, colors: &ThemeColors) {
+        // Responsive card dimensions
+        let card_width = (rect.width() * 0.88).clamp(500.0, 920.0);
+        let card_height = (rect.height() * 0.65).clamp(240.0, 560.0);
+        let card_rect = egui::Rect::from_center_size(center, vec2(card_width, card_height));
+
+        // Soft accent glow around card
+        ui.painter().rect_stroke(
+            card_rect.expand(2.0),
+            CornerRadius::same(14),
+            Stroke::new(1.0_f32, colors.accent_glow),
+            StrokeKind::Outside,
+        );
+
+        // Card surface background & border
+        ui.painter().rect_filled(card_rect, CornerRadius::same(12), colors.surface);
+        ui.painter().rect_stroke(
+            card_rect,
+            CornerRadius::same(12),
+            Stroke::new(1.0_f32, colors.border),
+            StrokeKind::Inside,
+        );
+
+        // Accent indicator bar on left edge
+        let guide_rect = egui::Rect::from_min_max(
+            card_rect.left_top() + vec2(0.0, 12.0),
+            card_rect.left_bottom() + vec2(4.0, -12.0),
+        );
+        ui.painter().rect_filled(guide_rect, CornerRadius::same(2), colors.accent);
+
+        // Context paragraphs above & below (if enabled)
+        if self.config.show_context_lines {
+            if let Some(prev) = self.prev_paragraph() {
+                let prev_preview = truncate_str(&prev.text, 85);
+                ui.painter().text(
+                    egui::pos2(center.x, card_rect.top() - 16.0),
+                    Align2::CENTER_BOTTOM,
+                    format!("▲ Previous: {}", prev_preview),
+                    FontId::proportional(12.0),
+                    colors.text_faint,
+                );
+            }
+
+            if let Some(next) = self.next_paragraph() {
+                let next_preview = truncate_str(&next.text, 85);
+                ui.painter().text(
+                    egui::pos2(center.x, card_rect.bottom() + 16.0),
+                    Align2::CENTER_TOP,
+                    format!("▼ Next: {}", next_preview),
+                    FontId::proportional(12.0),
+                    colors.text_faint,
+                );
+            }
+        }
+
+        // Inner content area
+        let inner_rect = card_rect.shrink2(vec2(28.0, 20.0));
+        let cur_sec_idx = self.document.current_section_index(self.word_index);
+        let cur_sec_title = self.document.sections.get(cur_sec_idx)
+            .map(|s| s.title.as_str())
+            .unwrap_or("Start");
+
+        let para_font_size = (self.config.font_size * 0.65).clamp(18.0, 32.0);
+
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inner_rect), |ui| {
+            ui.vertical(|ui| {
+                // Header badge row inside the card
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("¶ PARAGRAPH {} / {}", self.paragraph_index + 1, self.document.total_paragraphs))
+                            .color(colors.accent)
+                            .strong()
+                            .size(13.0),
+                    );
+
+                    ui.label(
+                        RichText::new(format!("• {}", truncate_str(cur_sec_title, 36)))
+                            .color(colors.text_secondary)
+                            .size(12.0),
+                    );
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if let Some(para) = self.current_paragraph() {
+                            let word_count = para.word_indices.end.saturating_sub(para.word_indices.start);
+                            let duration_sec = (word_count as f32 / (self.config.wpm as f32 / 60.0)).max(0.5);
+                            ui.label(
+                                RichText::new(format!("{} words • ~{:.1}s at {} WPM", word_count, duration_sec, self.config.wpm))
+                                    .color(colors.text_faint)
+                                    .size(11.0),
+                            );
+                        }
+                    });
+                });
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(12.0);
+
+                // Paragraph Text Content with vertical scroll if long
+                if let Some(para) = self.current_paragraph() {
+                    ScrollArea::vertical()
+                        .id_salt("paragraph_scroll_area")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let rich_text = RichText::new(&para.text)
+                                .size(para_font_size)
+                                .color(colors.text_primary)
+                                .line_height(Some(para_font_size * 1.55));
+                            ui.label(rich_text);
+                        });
+                } else {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        ui.label(
+                            RichText::new("Ready to read. Press Space to start.")
+                                .size(para_font_size * 0.8)
+                                .color(colors.text_secondary),
+                        );
+                    });
+                }
+            });
+        });
+
+        // Reading playback progress indicator bar at bottom edge of card
+        if self.is_playing {
+            let elapsed_ms = self.last_tick.elapsed().as_secs_f32() * 1000.0;
+            let progress = (elapsed_ms / self.step_duration_ms).clamp(0.0, 1.0);
+            let bar_height = 3.5;
+            let bar_rect = egui::Rect::from_min_max(
+                card_rect.left_bottom() + vec2(12.0, -bar_height - 4.0),
+                egui::pos2(
+                    card_rect.left() + 12.0 + (card_rect.width() - 24.0) * progress,
+                    card_rect.bottom() - 4.0,
+                ),
+            );
+            ui.painter().rect_filled(bar_rect, CornerRadius::same(2), colors.accent);
         }
     }
 

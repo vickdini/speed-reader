@@ -105,3 +105,60 @@ fn test_text_cleaner_comma_and_glued_words() {
     assert!(output.contains("economy Without"));
     assert!(output.contains("1,000")); // Number preserved
 }
+
+#[test]
+fn test_paragraph_chunking_and_indexing() {
+    let multi_para_text = r#"This is paragraph number one. It contains two whole sentences.
+
+Here is paragraph number two. It continues the discussion with further thoughts.
+
+And finally paragraph three concludes the text."#;
+
+    let doc = Document::from_text("Multi Para".to_string(), None, multi_para_text, 6);
+
+    assert_eq!(doc.total_paragraphs, 3);
+    assert_eq!(doc.paragraphs.len(), 3);
+
+    // Verify each paragraph has valid non-overlapping word ranges
+    assert_eq!(doc.paragraphs[0].word_indices.start, 0);
+    assert_eq!(doc.paragraphs[1].word_indices.start, doc.paragraphs[0].word_indices.end);
+    assert_eq!(doc.paragraphs[2].word_indices.start, doc.paragraphs[1].word_indices.end);
+    assert_eq!(doc.paragraphs[2].word_indices.end, doc.total_words);
+
+    // Verify bi-directional word <-> paragraph lookup
+    let p0_word = doc.word_for_paragraph(0);
+    assert_eq!(p0_word, 0);
+    assert_eq!(doc.paragraph_for_word(p0_word), 0);
+
+    let p1_word = doc.word_for_paragraph(1);
+    assert!(p1_word > 0);
+    assert_eq!(doc.paragraph_for_word(p1_word), 1);
+
+    let p2_word = doc.word_for_paragraph(2);
+    assert_eq!(doc.paragraph_for_word(p2_word), 2);
+
+    // Verify line <-> paragraph lookup
+    let p1_line = doc.line_for_paragraph(1);
+    assert_eq!(doc.paragraph_for_line(p1_line), 1);
+}
+
+#[test]
+fn test_demo_document_has_paragraphs() {
+    let doc = Document::demo_document(8);
+    assert!(doc.total_paragraphs >= 4);
+    assert_eq!(doc.sections.len(), 4);
+    for sec in &doc.sections {
+        assert!(sec.paragraph_count >= 1);
+    }
+}
+
+#[test]
+fn test_reading_mode_serialization() {
+    use speed_reader::storage::ReadingMode;
+
+    let serialized = serde_json::to_string(&ReadingMode::Paragraph).expect("serialize");
+    assert_eq!(serialized, "\"Paragraph\"");
+
+    let deserialized: ReadingMode = serde_json::from_str(&serialized).expect("deserialize");
+    assert_eq!(deserialized, ReadingMode::Paragraph);
+}

@@ -20,29 +20,35 @@ Speed Reader solves this with dedicated focus features:
 * **Context lines**: Shows the previous and next lines faintly above and below (with soft opacity) so you never feel disoriented or lose your place in the narrative.
 * **Accent visual guide**: A vertical anchor guide grounds your vision on the active line.
 
-### 2. ✦ RSVP Word Mode (Spritz-Style)
+### 2. ¶ Paragraph Mode (Deep Reading & Context)
+* Displays a **complete, cohesive paragraph at a time** within an elegant, centered card.
+* **Pacing timer & live progress bar**: Dynamically calculates the paragraph reading duration based on word count and your selected WPM, with a smooth progress bar showing when the next paragraph will appear.
+* **Context previews**: Faint preview snippets of the previous and next paragraphs above and below keep you anchored in the narrative flow.
+* **Header stats**: Shows active paragraph number, current chapter/page, word count, and estimated read time.
+
+### 3. ✦ RSVP Word Mode (Spritz-Style)
 * Words flash at a fixed point on screen at your chosen reading speed (60 to 1,200 WPM).
 * **Optimal Recognition Point (ORP)**: Calculates the exact eye-fixation point of every word and highlights it in a vivid accent color (coral / amber / cyan) between top and bottom alignment ticks. Your eyes never have to move!
 * Upcoming preview line below keeps you contextually aware.
 
-### 3. 📑 PDF Page & EPUB Chapter Selector
+### 4. 📑 PDF Page & EPUB Chapter Selector
 * **Start at any Page or Chapter**: Click the section badge in the header or press <kbd>P</kbd> to open the navigator.
 * **Direct Page Jump**: Enter any page number (e.g., jump straight to Page 24 of 80).
 * **Search Filter**: Search chapter titles with real-time filtering.
 * **Quick Steppers**: Jump to previous / next chapter with <kbd>[</kbd> and <kbd>]</kbd> or the header buttons.
 
-### 4. 📚 Reading Library & File Removal
+### 5. 📚 Reading Library & File Removal
 * **Recent Books Manager**: Click **📚 Library** or press <kbd>B</kbd> to view your reading shelf.
 * **Remove Files**: Remove books you are no longer interested in with the red **🗑 Remove** button.
 * **Clear History**: Clear old books at any time with one click.
-* **Resume Progress**: Shows your exact percentage, current word, and last-read timestamp.
+* **Resume Progress**: Shows your exact percentage, current word/paragraph, and last-read timestamp.
 
-### 5. 🧠 Smart Punctuation Pausing
+### 6. 🧠 Smart Punctuation Pausing
 * Naturally pauses slightly longer on periods (`.`, `!`, `?`) and paragraph ends (2.2x – 2.4x duration) so your brain has time to absorb sentence conclusions.
 * Micro-pauses on commas, semicolons, and dashes (`1.5x duration`).
 * Eliminates the "rushed feeling" and dramatically improves retention.
 
-### 6. ⛶ Zen / Full Focus Mode
+### 7. ⛶ Zen / Full Focus Mode
 * Starts **maximized** by default to fill your screen.
 * Press <kbd>F</kbd> or <kbd>F11</kbd> to toggle **Zen Mode**: completely hides all buttons, sliders, progress bars, and header chrome.
 * Leaves only you and the active text in pure, distraction-free isolation.
@@ -67,15 +73,15 @@ Speed Reader solves this with dedicated focus features:
 | Shortcut | Action |
 | :--- | :--- |
 | <kbd>Space</kbd> | **Play / Pause** reading |
-| <kbd>←</kbd> / <kbd>H</kbd> | Step back 1 line / word |
-| <kbd>→</kbd> / <kbd>L</kbd> | Step forward 1 line / word |
-| <kbd>Shift</kbd> + <kbd>←</kbd> / <kbd>→</kbd> | Jump 10 lines / words backward / forward |
+| <kbd>←</kbd> / <kbd>H</kbd> | Step back 1 item (line, paragraph, or word) |
+| <kbd>→</kbd> / <kbd>L</kbd> | Step forward 1 item (line, paragraph, or word) |
+| <kbd>Shift</kbd> + <kbd>←</kbd> / <kbd>→</kbd> | Jump 10 lines / paragraphs / words backward / forward |
 | <kbd>[</kbd> / <kbd>]</kbd> | Jump to **Previous / Next Chapter or Page** |
 | <kbd>P</kbd> | Open **Chapter / Page Selector** (Direct page jump + list) |
 | <kbd>B</kbd> | Open **Library Manager** (Resume or **Remove Books**) |
 | <kbd>↑</kbd> / <kbd>K</kbd> | Increase speed (+25 WPM) |
 | <kbd>↓</kbd> / <kbd>J</kbd> | Decrease speed (-25 WPM) |
-| <kbd>M</kbd> | Switch between **Line Mode** and **Word RSVP Mode** |
+| <kbd>M</kbd> | Cycle through **Line Mode**, **Paragraph Mode**, and **Word RSVP Mode** |
 | <kbd>F</kbd> / <kbd>F11</kbd> | Toggle **Zen Focus Mode** (hides all UI chrome) |
 | <kbd>R</kbd> | Rewind to beginning of book |
 | <kbd>Esc</kbd> | Close modals / Exit Zen Mode / Pause |

@@ -81,13 +81,25 @@ pub struct ReadingLine {
     pub is_paragraph_start: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReadingParagraph {
+    pub text: String,
+    pub word_indices: std::ops::Range<usize>,
+    pub line_indices: std::ops::Range<usize>,
+    pub pause_multiplier: f32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DocumentSection {
     pub title: String,
     pub start_word_index: usize,
     pub start_line_index: usize,
+    #[serde(default)]
+    pub start_paragraph_index: usize,
     pub word_count: usize,
     pub line_count: usize,
+    #[serde(default)]
+    pub paragraph_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -96,9 +108,37 @@ pub struct Document {
     pub file_path: Option<PathBuf>,
     pub tokens: Vec<Token>,
     pub lines: Vec<ReadingLine>,
+    pub paragraphs: Vec<ReadingParagraph>,
     pub sections: Vec<DocumentSection>,
     pub total_words: usize,
     pub total_lines: usize,
+    pub total_paragraphs: usize,
+}
+
+/// Helper function to split cleaned text into distinct paragraph blocks
+pub fn split_text_paragraphs(cleaned: &str) -> Vec<String> {
+    let mut raw_paras: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    for line in cleaned.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if !current.trim().is_empty() {
+                raw_paras.push(current.trim().to_string());
+                current.clear();
+            }
+        } else {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(trimmed);
+        }
+    }
+    if !current.trim().is_empty() {
+        raw_paras.push(current.trim().to_string());
+    }
+
+    raw_paras
 }
 
 impl Document {
@@ -110,21 +150,25 @@ impl Document {
     ) -> Self {
         let mut tokens = Vec::new();
         let mut lines = Vec::new();
+        let mut paragraphs = Vec::new();
         let mut sections = Vec::new();
 
         for sec in extracted_sections {
             let start_word_idx = tokens.len();
             let start_line_idx = lines.len();
+            let start_para_idx = paragraphs.len();
 
             let cleaned = crate::text_cleaner::clean_text_for_reading(&sec.content);
-            let paragraphs: Vec<&str> = cleaned.split('\n').collect();
+            let sec_paras = split_text_paragraphs(&cleaned);
 
-            for paragraph in paragraphs {
+            for paragraph in sec_paras {
                 let words: Vec<&str> = paragraph.split_whitespace().collect();
                 if words.is_empty() {
                     continue;
                 }
 
+                let para_start_word_idx = tokens.len();
+                let para_start_line_idx = lines.len();
                 let num_words = words.len();
                 let mut current_line_words = Vec::new();
                 let mut line_start_idx = tokens.len();
@@ -155,29 +199,43 @@ impl Document {
                             1.0
                         };
 
+                        let is_para_start = lines.len() == para_start_line_idx;
                         lines.push(ReadingLine {
                             text: line_text,
                             word_indices: line_start_idx..line_end_idx,
                             pause_multiplier: pause_mult,
-                            is_paragraph_start: lines.is_empty() || lines.len() == start_line_idx,
+                            is_paragraph_start: is_para_start,
                         });
 
                         current_line_words.clear();
                         line_start_idx = line_end_idx;
                     }
                 }
+
+                let para_end_word_idx = tokens.len();
+                let para_end_line_idx = lines.len();
+
+                paragraphs.push(ReadingParagraph {
+                    text: words.join(" "),
+                    word_indices: para_start_word_idx..para_end_word_idx,
+                    line_indices: para_start_line_idx..para_end_line_idx,
+                    pause_multiplier: 1.15,
+                });
             }
 
             let word_count = tokens.len() - start_word_idx;
             let line_count = lines.len() - start_line_idx;
+            let para_count = paragraphs.len() - start_para_idx;
 
             if word_count > 0 {
                 sections.push(DocumentSection {
                     title: sec.title,
                     start_word_index: start_word_idx,
                     start_line_index: start_line_idx,
+                    start_paragraph_index: start_para_idx,
                     word_count,
                     line_count,
+                    paragraph_count: para_count,
                 });
             }
         }
@@ -188,22 +246,27 @@ impl Document {
                 title: "Introduction".to_string(),
                 start_word_index: 0,
                 start_line_index: 0,
+                start_paragraph_index: 0,
                 word_count: tokens.len(),
                 line_count: lines.len(),
+                paragraph_count: paragraphs.len(),
             });
         }
 
         let total_words = tokens.len();
         let total_lines = lines.len();
+        let total_paragraphs = paragraphs.len();
 
         Self {
             title,
             file_path,
             tokens,
             lines,
+            paragraphs,
             sections,
             total_words,
             total_lines,
+            total_paragraphs,
         }
     }
 
@@ -259,6 +322,44 @@ impl Document {
         }
     }
 
+    /// Find the corresponding paragraph index for a given word index
+    pub fn paragraph_for_word(&self, word_idx: usize) -> usize {
+        for (i, para) in self.paragraphs.iter().enumerate() {
+            if para.word_indices.contains(&word_idx) {
+                return i;
+            }
+        }
+        self.paragraphs.len().saturating_sub(1)
+    }
+
+    /// Find the start word index for a given paragraph index
+    pub fn word_for_paragraph(&self, para_idx: usize) -> usize {
+        if para_idx < self.paragraphs.len() {
+            self.paragraphs[para_idx].word_indices.start
+        } else {
+            self.tokens.len().saturating_sub(1)
+        }
+    }
+
+    /// Find the corresponding paragraph index for a given line index
+    pub fn paragraph_for_line(&self, line_idx: usize) -> usize {
+        for (i, para) in self.paragraphs.iter().enumerate() {
+            if para.line_indices.contains(&line_idx) {
+                return i;
+            }
+        }
+        self.paragraphs.len().saturating_sub(1)
+    }
+
+    /// Find the start line index for a given paragraph index
+    pub fn line_for_paragraph(&self, para_idx: usize) -> usize {
+        if para_idx < self.paragraphs.len() {
+            self.paragraphs[para_idx].line_indices.start
+        } else {
+            self.lines.len().saturating_sub(1)
+        }
+    }
+
     /// Sample demo document with chapters for immediate testing
     pub fn demo_document(words_per_line: usize) -> Self {
         let title = "Speed Reader: The Distraction-Free Guide".to_string();
@@ -272,12 +373,12 @@ If you struggle with focus and find yourself reading the same sentence three tim
 Traditional reading forces your eyes to jump back and forth across wide margins. Each jump is an opportunity for your mind to wander, get distracted, or lose track of where you were."#.to_string(),
             },
             ExtractedSection {
-                title: "Chapter 2: How Line-by-Line Pacing Works".to_string(),
+                title: "Chapter 2: Line-by-Line & Paragraph Pacing".to_string(),
                 content: r#"With Line-by-Line mode, you see only one focused thought at a time. The world fades away, leaving just you and the active words.
 
-Notice the gentle context lines above and below. They keep you anchored in the story without distracting your central vision.
+With Paragraph mode, you absorb whole cohesive thoughts with elegant context above and below, pacing effortlessly through literature.
 
-Each line is paced according to natural thought clauses, pausing longer at periods and commas so your mind retains what it reads."#.to_string(),
+Press M to toggle between Line, Paragraph, and RSVP modes anytime. Each line or paragraph pauses naturally according to punctuation and comprehension."#.to_string(),
             },
             ExtractedSection {
                 title: "Chapter 3: Optimal Recognition Points & RSVP".to_string(),

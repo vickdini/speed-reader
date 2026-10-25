@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReadingMode {
     Line,
+    Paragraph,
     WordRsvp,
 }
 
@@ -33,8 +34,12 @@ pub struct BookBookmark {
     pub title: String,
     pub word_index: usize,
     pub line_index: usize,
+    #[serde(default)]
+    pub paragraph_index: usize,
     pub total_words: usize,
     pub total_lines: usize,
+    #[serde(default)]
+    pub total_paragraphs: usize,
     pub wpm: u32,
     pub mode: ReadingMode,
     pub last_read: u64,
@@ -96,7 +101,19 @@ impl AppConfig {
         }
     }
 
-    pub fn update_bookmark(&mut self, path: &Path, title: &str, word_idx: usize, line_idx: usize, total_words: usize, total_lines: usize, wpm: u32, mode: ReadingMode) {
+    pub fn update_bookmark(
+        &mut self,
+        path: &Path,
+        title: &str,
+        word_idx: usize,
+        line_idx: usize,
+        paragraph_idx: usize,
+        total_words: usize,
+        total_lines: usize,
+        total_paragraphs: usize,
+        wpm: u32,
+        mode: ReadingMode,
+    ) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -111,8 +128,10 @@ impl AppConfig {
             title: title.to_string(),
             word_index: word_idx,
             line_index: line_idx,
+            paragraph_index: paragraph_idx,
             total_words,
             total_lines,
+            total_paragraphs,
             wpm,
             mode,
             last_read: now,
