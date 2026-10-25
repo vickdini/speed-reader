@@ -59,3 +59,49 @@ fn test_document_line_chunking() {
     let start_word_of_line0 = doc.word_for_line(0);
     assert_eq!(start_word_of_line0, 0);
 }
+
+#[test]
+fn test_lopdf_methods() {
+    let doc = lopdf::Document::new();
+    let _ = doc.get_pages();
+    let _ = doc.extract_text(&[1]);
+}
+
+#[test]
+fn test_text_cleaner_hyphen_unwrap() {
+    use speed_reader::text_cleaner::clean_text_for_reading;
+
+    let input = "reengineering was a manage-\nment fad of the early 1990s.";
+    let output = clean_text_for_reading(input);
+    assert!(output.contains("management"), "Expected 'management', got: {}", output);
+    assert!(!output.contains("manage-"), "Should not contain hyphen: {}", output);
+}
+
+#[test]
+fn test_text_cleaner_soft_hyphen() {
+    use speed_reader::text_cleaner::clean_text_for_reading;
+
+    let input = "reengi\u{00AD}neering is a concept";
+    let output = clean_text_for_reading(input);
+    assert_eq!(output.trim(), "reengineering is a concept");
+}
+
+#[test]
+fn test_text_cleaner_period_spacing() {
+    use speed_reader::text_cleaner::clean_text_for_reading;
+
+    let input = "This was a disaster.Reengineering came along.";
+    let output = clean_text_for_reading(input);
+    assert_eq!(output.trim(), "This was a disaster. Reengineering came along.");
+}
+
+#[test]
+fn test_text_cleaner_comma_and_glued_words() {
+    use speed_reader::text_cleaner::clean_text_for_reading;
+
+    let input = "fast,the economyWithout boundaries was 1,000 strong.";
+    let output = clean_text_for_reading(input);
+    assert!(output.contains("fast, the"));
+    assert!(output.contains("economy Without"));
+    assert!(output.contains("1,000")); // Number preserved
+}

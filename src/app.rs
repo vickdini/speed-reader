@@ -1,11 +1,11 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use egui::{
     vec2, Align, Align2, Color32, CornerRadius, FontId, Frame, Key, Layout, Margin, RichText,
-    Stroke, StrokeKind,
+    ScrollArea, Stroke, StrokeKind, TextEdit,
 };
 
-use crate::parser::load_document;
+use crate::parser::load_document_sections;
 use crate::reader::{Document, ReadingLine, Token};
 use crate::storage::{AppConfig, AppTheme, ReadingMode};
 
@@ -19,13 +19,19 @@ pub struct SpeedReaderApp {
     pub step_duration_ms: f32,
     pub zen_mode: bool,
     pub show_settings: bool,
+    pub show_chapter_modal: bool,
+    pub show_library_modal: bool,
+    pub chapter_search_filter: String,
+    pub page_jump_input: String,
+    pub modal_error: Option<String>,
+    pub first_frame: bool,
     pub status_message: Option<(String, Instant)>,
 }
 
 impl SpeedReaderApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let mut config = AppConfig::load();
-        
+
         // Start with demo document or most recent book
         let mut document = Document::demo_document(config.words_per_line);
         let mut word_idx = 0;
@@ -33,8 +39,13 @@ impl SpeedReaderApp {
 
         if let Some(recent) = config.recent_books.first().cloned() {
             if recent.file_path.exists() {
-                if let Ok((title, text)) = load_document(&recent.file_path) {
-                    document = Document::from_text(title, Some(recent.file_path.clone()), &text, config.words_per_line);
+                if let Ok((title, sections)) = load_document_sections(&recent.file_path) {
+                    document = Document::from_sections(
+                        title,
+                        Some(recent.file_path.clone()),
+                        sections,
+                        config.words_per_line,
+                    );
                     word_idx = recent.word_index.min(document.total_words.saturating_sub(1));
                     line_idx = recent.line_index.min(document.total_lines.saturating_sub(1));
                     config.wpm = recent.wpm;
@@ -53,6 +64,12 @@ impl SpeedReaderApp {
             step_duration_ms: 250.0,
             zen_mode: false,
             show_settings: false,
+            show_chapter_modal: false,
+            show_library_modal: false,
+            chapter_search_filter: String::new(),
+            page_jump_input: String::new(),
+            modal_error: None,
+            first_frame: true,
             status_message: None,
         }
     }
@@ -62,22 +79,43 @@ impl SpeedReaderApp {
     }
 
     pub fn open_file(&mut self, path: PathBuf) {
-        match load_document(&path) {
-            Ok((title, text)) => {
-                let doc = Document::from_text(title.clone(), Some(path.clone()), &text, self.config.words_per_line);
+        match load_document_sections(&path) {
+            Ok((title, sections)) => {
+                let section_count = sections.len();
+                let is_pdf = sections.iter().any(|s| s.title.starts_with("Page "));
+                let section_type = if is_pdf { "pages" } else { "chapters" };
+
+                let doc = Document::from_sections(
+                    title.clone(),
+                    Some(path.clone()),
+                    sections,
+                    self.config.words_per_line,
+                );
                 let bookmark = self.config.get_bookmark(&path).cloned();
-                
+
                 self.document = doc;
                 if let Some(bm) = bookmark {
                     self.word_index = bm.word_index.min(self.document.total_words.saturating_sub(1));
                     self.line_index = bm.line_index.min(self.document.total_lines.saturating_sub(1));
                     self.config.wpm = bm.wpm;
                     self.config.active_mode = bm.mode;
-                    self.set_status(format!("Resumed '{}' at {:.1}%", title, self.progress_pct()));
+                    self.set_status(format!(
+                        "Resumed '{}' at {:.1}% ({} {})",
+                        title,
+                        self.progress_pct(),
+                        section_count,
+                        section_type
+                    ));
                 } else {
                     self.word_index = 0;
                     self.line_index = 0;
-                    self.set_status(format!("Loaded '{}' ({} words)", title, self.document.total_words));
+                    self.set_status(format!(
+                        "Loaded '{}' ({} {}, {} words)",
+                        title,
+                        section_count,
+                        section_type,
+                        self.document.total_words
+                    ));
                 }
                 self.is_playing = false;
                 self.save_current_bookmark();
@@ -100,6 +138,82 @@ impl SpeedReaderApp {
                 self.config.wpm,
                 self.config.active_mode,
             );
+        }
+    }
+
+    pub fn remove_book(&mut self, path: &Path) {
+        self.config.remove_bookmark(path);
+        self.set_status("Removed book from library");
+    }
+
+    pub fn clear_all_books(&mut self) {
+        self.config.clear_bookmarks();
+        self.set_status("Cleared reading library");
+    }
+
+    pub fn jump_to_section(&mut self, section_idx: usize) {
+        if let Some(sec) = self.document.sections.get(section_idx) {
+            self.word_index = sec.start_word_index;
+            self.line_index = sec.start_line_index;
+            self.is_playing = false;
+            self.set_status(format!("Jumped to {}", sec.title));
+            self.save_current_bookmark();
+        }
+    }
+
+    pub fn jump_to_page_input(&mut self) -> Result<String, String> {
+        let query = self.page_jump_input.trim();
+        if query.is_empty() {
+            let err = "Please enter a page or chapter number".to_string();
+            self.modal_error = Some(err.clone());
+            return Err(err);
+        }
+
+        // 1. Try direct 1-based page number
+        if let Ok(num) = query.parse::<usize>() {
+            if num >= 1 && num <= self.document.sections.len() {
+                self.jump_to_section(num - 1);
+                self.modal_error = None;
+                return Ok(format!("Jumped to {}", self.document.sections[num - 1].title));
+            }
+        }
+
+        // 2. Try matching printed book page number or title query (e.g. "215" in "Page 222 — One Company's Experience: Deere 215")
+        let query_lower = query.to_lowercase();
+        let mut matched_idx = None;
+        for (idx, sec) in self.document.sections.iter().enumerate() {
+            if sec.title.to_lowercase().contains(&query_lower) {
+                matched_idx = Some(idx);
+                break;
+            }
+        }
+
+        if let Some(idx) = matched_idx {
+            self.jump_to_section(idx);
+            self.modal_error = None;
+            return Ok(format!("Jumped to {}", self.document.sections[idx].title));
+        }
+
+        let err = format!(
+            "Page/Chapter '{}' not found (document has 1 to {} sections)",
+            query,
+            self.document.sections.len()
+        );
+        self.modal_error = Some(err.clone());
+        Err(err)
+    }
+
+    pub fn jump_to_prev_section(&mut self) {
+        let cur_idx = self.document.current_section_index(self.word_index);
+        if cur_idx > 0 {
+            self.jump_to_section(cur_idx - 1);
+        }
+    }
+
+    pub fn jump_to_next_section(&mut self) {
+        let cur_idx = self.document.current_section_index(self.word_index);
+        if cur_idx + 1 < self.document.sections.len() {
+            self.jump_to_section(cur_idx + 1);
         }
     }
 
@@ -255,9 +369,14 @@ impl SpeedReaderApp {
 
     pub fn rebuild_document_lines(&mut self) {
         if let Some(path) = self.document.file_path.clone() {
-            if let Ok((title, text)) = load_document(&path) {
+            if let Ok((title, sections)) = load_document_sections(&path) {
                 let cur_word = self.word_index;
-                self.document = Document::from_text(title, Some(path), &text, self.config.words_per_line);
+                self.document = Document::from_sections(
+                    title,
+                    Some(path),
+                    sections,
+                    self.config.words_per_line,
+                );
                 self.word_index = cur_word.min(self.document.total_words.saturating_sub(1));
                 self.line_index = self.document.line_for_word(self.word_index);
             }
@@ -344,6 +463,11 @@ pub struct ThemeColors {
 
 impl eframe::App for SpeedReaderApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.first_frame {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            self.first_frame = false;
+        }
+
         let colors = self.get_theme_colors();
 
         // Check for dropped files (drag & drop support)
@@ -367,11 +491,15 @@ impl eframe::App for SpeedReaderApp {
                 i.key_pressed(Key::M),
                 i.key_pressed(Key::R),
                 i.key_pressed(Key::Escape),
+                i.key_pressed(Key::P),
+                i.key_pressed(Key::B),
+                i.key_pressed(Key::OpenBracket),
+                i.key_pressed(Key::CloseBracket),
                 i.modifiers.shift,
             )
         });
 
-        let (space, left, right, up, down, key_f, key_m, key_r, esc, shift) = input;
+        let (space, left, right, up, down, key_f, key_m, key_r, esc, key_p, key_b, open_bracket, close_bracket, shift) = input;
 
         if space {
             self.toggle_play();
@@ -422,8 +550,26 @@ impl eframe::App for SpeedReaderApp {
             self.line_index = 0;
             self.set_status("Rewound to start");
         }
+        if key_p {
+            self.show_chapter_modal = !self.show_chapter_modal;
+        }
+        if key_b {
+            self.show_library_modal = !self.show_library_modal;
+        }
+        if open_bracket {
+            self.jump_to_prev_section();
+        }
+        if close_bracket {
+            self.jump_to_next_section();
+        }
         if esc {
-            if self.zen_mode {
+            if self.show_chapter_modal {
+                self.show_chapter_modal = false;
+            } else if self.show_library_modal {
+                self.show_library_modal = false;
+            } else if self.show_settings {
+                self.show_settings = false;
+            } else if self.zen_mode {
                 self.zen_mode = false;
             } else if self.is_playing {
                 self.toggle_play();
@@ -437,7 +583,7 @@ impl eframe::App for SpeedReaderApp {
                 self.step_forward();
                 self.last_tick = Instant::now();
                 self.step_duration_ms = self.calculate_step_duration();
-                
+
                 // Auto-save every 30 seconds
                 self.save_current_bookmark();
             }
@@ -473,7 +619,7 @@ impl eframe::App for SpeedReaderApp {
                                 .size(18.0),
                         );
 
-                        ui.add_space(16.0);
+                        ui.add_space(12.0);
 
                         // Open File Button
                         if ui.button(RichText::new("📁 Open Book").color(colors.text_primary)).clicked() {
@@ -488,33 +634,43 @@ impl eframe::App for SpeedReaderApp {
                             }
                         }
 
-                        // Recent Books Dropdown
-                        if !self.config.recent_books.is_empty() {
-                            egui::ComboBox::from_id_salt("recent_books_combo")
-                                .selected_text(
-                                    RichText::new(format!("📚 {}", self.document.title))
-                                        .color(colors.text_secondary)
-                                        .size(13.0),
-                                )
-                                .show_ui(ui, |ui| {
-                                    let mut selected_path = None;
-                                    for book in &self.config.recent_books {
-                                        let pct = if book.total_words > 0 {
-                                            (book.word_index as f32 / book.total_words as f32) * 100.0
-                                        } else {
-                                            0.0
-                                        };
-                                        let label = format!("{} ({:.0}%)", book.title, pct);
-                                        if ui.selectable_label(self.document.title == book.title, label).clicked() {
-                                            selected_path = Some(book.file_path.clone());
-                                        }
-                                    }
-                                    if let Some(p) = selected_path {
-                                        self.open_file(p);
-                                    }
-                                });
-                        } else {
-                            ui.label(RichText::new(&self.document.title).color(colors.text_secondary).italics());
+                        // Library / Saved Books Button with badge
+                        let library_label = format!("📚 Library ({})", self.config.recent_books.len());
+                        if ui.button(RichText::new(library_label).color(colors.text_secondary)).clicked() {
+                            self.show_library_modal = !self.show_library_modal;
+                        }
+
+                        ui.add_space(8.0);
+
+                        // Chapter / Page Selector Button
+                        let cur_sec_idx = self.document.current_section_index(self.word_index);
+                        let total_secs = self.document.sections.len();
+                        let cur_sec_title = self.document.sections.get(cur_sec_idx)
+                            .map(|s| s.title.as_str())
+                            .unwrap_or("Start");
+
+                        let section_btn_text = format!(
+                            "📑 {} ({}/{})",
+                            truncate_str(cur_sec_title, 24),
+                            cur_sec_idx + 1,
+                            total_secs
+                        );
+
+                        // Prev section button
+                        if ui.button("⏮").on_hover_text("Previous Chapter / Page ([)").clicked() {
+                            self.jump_to_prev_section();
+                        }
+
+                        // Clickable section badge
+                        if ui.button(RichText::new(section_btn_text).color(colors.accent)).on_hover_text("Select Chapter / Page (P)").clicked() {
+                            self.show_chapter_modal = !self.show_chapter_modal;
+                            self.chapter_search_filter.clear();
+                            self.page_jump_input = (cur_sec_idx + 1).to_string();
+                        }
+
+                        // Next section button
+                        if ui.button("⏭").on_hover_text("Next Chapter / Page (])").clicked() {
+                            self.jump_to_next_section();
                         }
 
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -576,20 +732,22 @@ impl eframe::App for SpeedReaderApp {
                         ui.horizontal(|ui| {
                             let mut pct = self.progress_pct();
                             ui.label(RichText::new(format!("{:.1}%", pct)).color(colors.text_secondary).size(12.0));
-                            
+
                             let slider = egui::Slider::new(&mut pct, 0.0..=100.0)
                                 .show_value(false)
                                 .trailing_fill(true);
-                            let response = ui.add_sized([ui.available_width() - 110.0, 16.0], slider);
+                            let response = ui.add_sized([ui.available_width() - 150.0, 16.0], slider);
                             if response.changed() {
                                 self.jump_to_progress(pct);
                             }
 
+                            let cur_sec_idx = self.document.current_section_index(self.word_index);
+                            let sec_type = self.document.section_type_label();
                             let stats_text = match self.config.active_mode {
-                                ReadingMode::Line => format!("{}/{} lines", self.line_index + 1, self.document.total_lines),
-                                ReadingMode::WordRsvp => format!("{}/{} words", self.word_index + 1, self.document.total_words),
+                                ReadingMode::Line => format!("{}/{} lines | {} {}/{}", self.line_index + 1, self.document.total_lines, sec_type, cur_sec_idx + 1, self.document.sections.len()),
+                                ReadingMode::WordRsvp => format!("{}/{} words | {} {}/{}", self.word_index + 1, self.document.total_words, sec_type, cur_sec_idx + 1, self.document.sections.len()),
                             };
-                            ui.label(RichText::new(stats_text).color(colors.text_secondary).size(12.0));
+                            ui.label(RichText::new(stats_text).color(colors.text_secondary).size(11.0));
                         });
 
                         ui.add_space(8.0);
@@ -673,7 +831,7 @@ impl eframe::App for SpeedReaderApp {
                                     }
                                 } else {
                                     ui.label(
-                                        RichText::new("Space: Play/Pause | Arrows: Nav & Speed | F: Zen")
+                                        RichText::new("Space: Play/Pause | Arrows: Nav | [ / ]: Chapters | F: Zen")
                                             .color(colors.text_faint)
                                             .size(11.0),
                                     );
@@ -684,11 +842,243 @@ impl eframe::App for SpeedReaderApp {
                 });
         }
 
+        // Chapter / Page Selection Modal Window
+        if self.show_chapter_modal {
+            let mut close_modal = false;
+            let sec_type = self.document.section_type_label();
+            let total_sections = self.document.sections.len();
+            let modal_title = format!("📑 Jump to {} (Total: {})", sec_type, total_sections);
+
+            egui::Window::new(modal_title)
+                .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+                .collapsible(false)
+                .resizable(true)
+                .default_size([520.0, 500.0])
+                .frame(Frame::NONE.fill(colors.surface).inner_margin(Margin::same(18)).corner_radius(12))
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading(RichText::new(format!("Select {} to Start", sec_type)).color(colors.text_primary).size(16.0));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button("✕ Close").clicked() {
+                                close_modal = true;
+                            }
+                        });
+                    });
+
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    // Direct Page / Chapter Number Jump input
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("Enter {} # :", sec_type)).color(colors.text_secondary));
+                        let edit = TextEdit::singleline(&mut self.page_jump_input).desired_width(80.0);
+                        let response = ui.add(edit);
+                        let enter_pressed = response.has_focus() && ctx.input(|i| i.key_pressed(Key::Enter));
+                        let go_clicked = ui.button(RichText::new("Go ➔").color(colors.accent).strong()).clicked();
+
+                        if enter_pressed || go_clicked {
+                            if self.jump_to_page_input().is_ok() {
+                                close_modal = true;
+                            }
+                        }
+
+                        ui.label(RichText::new(format!("(1 to {})", total_sections)).color(colors.text_faint).size(12.0));
+                    });
+
+                    // Quick Page Slider for fast scrubbing
+                    if total_sections > 1 {
+                        let cur_sec_idx = self.document.current_section_index(self.word_index);
+                        let mut slider_val = (cur_sec_idx + 1) as u32;
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Quick Slider:").color(colors.text_secondary));
+                            if ui.add(egui::Slider::new(&mut slider_val, 1..=total_sections as u32).suffix(format!(" / {}", total_sections))).changed() {
+                                self.jump_to_section((slider_val as usize).saturating_sub(1));
+                                self.modal_error = None;
+                            }
+                        });
+                    }
+
+                    // Display error if jump failed
+                    if let Some(err) = &self.modal_error {
+                        ui.label(RichText::new(format!("⚠ {}", err)).color(Color32::from_rgb(255, 90, 90)).size(12.0));
+                    }
+
+                    ui.add_space(8.0);
+
+                    // Search Filter
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("🔍 Search:").color(colors.text_secondary));
+                        ui.add(
+                            TextEdit::singleline(&mut self.chapter_search_filter)
+                                .hint_text("Filter chapters, pages, or headings...")
+                                .desired_width(ui.available_width() - 20.0),
+                        );
+                    });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+
+                    // Scrollable list of sections
+                    let cur_sec_idx = self.document.current_section_index(self.word_index);
+                    let filter = self.chapter_search_filter.to_lowercase();
+
+                    ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                        let mut target_jump = None;
+                        for (idx, sec) in self.document.sections.iter().enumerate() {
+                            if !filter.is_empty() && !sec.title.to_lowercase().contains(&filter) {
+                                continue;
+                            }
+
+                            let is_current = idx == cur_sec_idx;
+                            let label_text = format!("{}. {}", idx + 1, sec.title);
+
+                            ui.horizontal(|ui| {
+                                let btn_text = if is_current {
+                                    RichText::new(format!("● {}", label_text)).color(colors.accent).strong()
+                                } else {
+                                    RichText::new(label_text).color(colors.text_primary)
+                                };
+
+                                if ui.button(btn_text).clicked() {
+                                    target_jump = Some(idx);
+                                }
+
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    ui.label(
+                                        RichText::new(format!("{} words", sec.word_count))
+                                            .color(colors.text_faint)
+                                            .size(11.0),
+                                    );
+                                });
+                            });
+                        }
+
+                        if let Some(jump_idx) = target_jump {
+                            self.jump_to_section(jump_idx);
+                            self.modal_error = None;
+                            close_modal = true;
+                        }
+                    });
+                });
+
+            if close_modal {
+                self.show_chapter_modal = false;
+                self.modal_error = None;
+            }
+        }
+
+        // Library / Saved Books Manager Modal Window
+        if self.show_library_modal {
+            let mut close_library = false;
+            let mut book_to_open = None;
+            let mut book_to_remove = None;
+            let mut clear_all_triggered = false;
+
+            egui::Window::new("📚 Reading Library & History")
+                .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+                .collapsible(false)
+                .resizable(true)
+                .default_size([560.0, 480.0])
+                .frame(Frame::NONE.fill(colors.surface).inner_margin(Margin::same(18)).corner_radius(12))
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading(
+                            RichText::new(format!("Recent Books ({})", self.config.recent_books.len()))
+                                .color(colors.text_primary)
+                                .size(16.0),
+                        );
+
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button("✕ Close").clicked() {
+                                close_library = true;
+                            }
+
+                            if !self.config.recent_books.is_empty() {
+                                if ui.button(RichText::new("Clear All History").color(Color32::from_rgb(255, 90, 90))).clicked() {
+                                    clear_all_triggered = true;
+                                }
+                            }
+                        });
+                    });
+
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    if self.config.recent_books.is_empty() {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(40.0);
+                            ui.label(RichText::new("No recent books in your library.").color(colors.text_secondary).size(15.0));
+                            ui.label(RichText::new("Drag and drop any PDF, EPUB, or TXT file into the window to add it!").color(colors.text_faint).size(12.0));
+                            ui.add_space(40.0);
+                        });
+                    } else {
+                        ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+                            for book in &self.config.recent_books {
+                                let pct = if book.total_words > 0 {
+                                    (book.word_index as f32 / book.total_words as f32) * 100.0
+                                } else {
+                                    0.0
+                                };
+
+                                let is_active = self.document.file_path.as_ref() == Some(&book.file_path);
+
+                                ui.group(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.vertical(|ui| {
+                                            let title_rich = if is_active {
+                                                RichText::new(format!("● {}", book.title)).color(colors.accent).strong().size(14.0)
+                                            } else {
+                                                RichText::new(&book.title).color(colors.text_primary).strong().size(14.0)
+                                            };
+                                            ui.label(title_rich);
+
+                                            let path_str = book.file_path.to_string_lossy();
+                                            ui.label(RichText::new(truncate_str(&path_str, 55)).color(colors.text_faint).size(11.0));
+
+                                            let stats = format!("{:.1}% read (word {} of {})", pct, book.word_index + 1, book.total_words);
+                                            ui.label(RichText::new(stats).color(colors.text_secondary).size(11.0));
+                                        });
+
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            // Remove book button
+                                            if ui.button(RichText::new("🗑 Remove").color(Color32::from_rgb(255, 90, 90))).on_hover_text("Remove this book from library").clicked() {
+                                                book_to_remove = Some(book.file_path.clone());
+                                            }
+
+                                            // Resume / Open button
+                                            let open_text = if is_active { "Reading Now" } else { "▶ Open" };
+                                            if ui.button(RichText::new(open_text).color(colors.accent)).clicked() {
+                                                book_to_open = Some(book.file_path.clone());
+                                            }
+                                        });
+                                    });
+                                });
+                                ui.add_space(4.0);
+                            }
+                        });
+                    }
+                });
+
+            if let Some(path) = book_to_remove {
+                self.remove_book(&path);
+            }
+            if clear_all_triggered {
+                self.clear_all_books();
+            }
+            if let Some(path) = book_to_open {
+                self.open_file(path);
+                close_library = true;
+            }
+            if close_library {
+                self.show_library_modal = false;
+            }
+        }
+
         // Settings Dialog / Side Drawer
         if self.show_settings && !self.zen_mode {
             egui::SidePanel::right("settings_panel")
                 .frame(Frame::NONE.fill(colors.surface).inner_margin(Margin::same(20)))
-                .min_width(260.0)
+                .min_width(270.0)
                 .show(ctx, |ui| {
                     ui.heading(RichText::new("⚙ Reading Settings").color(colors.text_primary).size(18.0));
                     ui.separator();
@@ -752,16 +1142,19 @@ impl eframe::App for SpeedReaderApp {
                         ("← / H", "Step Back"),
                         ("→ / L", "Step Forward"),
                         ("Shift + ←/→", "Jump 10 Words/Lines"),
+                        ("[ / ]", "Prev / Next Chapter or Page"),
+                        ("P", "Select Chapter / Page"),
+                        ("B", "Manage Library & History"),
                         ("↑ / ↓", "+25 / -25 WPM Speed"),
                         ("M", "Toggle Line / RSVP Mode"),
                         ("F / F11", "Toggle Zen Focus Mode"),
                         ("R", "Rewind to Start"),
-                        ("Esc", "Exit Zen Mode"),
+                        ("Esc", "Close Modals / Exit Zen"),
                     ];
                     for (k, desc) in shortcuts {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(k).strong().color(colors.accent).size(12.0));
-                            ui.label(RichText::new(desc).color(colors.text_secondary).size(12.0));
+                            ui.label(RichText::new(k).strong().color(colors.accent).size(11.0));
+                            ui.label(RichText::new(desc).color(colors.text_secondary).size(11.0));
                         });
                     }
                 });
@@ -958,5 +1351,14 @@ impl SpeedReaderApp {
                 colors.text_secondary,
             );
         }
+    }
+}
+
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.chars().count() <= max_len {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_len.saturating_sub(3)).collect();
+        format!("{}...", truncated)
     }
 }

@@ -1,7 +1,13 @@
 use std::path::Path;
 use epub::doc::EpubDoc;
 
-pub fn extract_epub_text(path: &Path) -> Result<(String, String), String> {
+#[derive(Debug, Clone)]
+pub struct ExtractedSection {
+    pub title: String,
+    pub content: String,
+}
+
+pub fn extract_epub_sections(path: &Path) -> Result<(String, Vec<ExtractedSection>), String> {
     let mut doc = EpubDoc::new(path).map_err(|e| format!("Failed to open EPUB: {}", e))?;
     
     let title = doc.mdata("title")
@@ -13,16 +19,21 @@ pub fn extract_epub_text(path: &Path) -> Result<(String, String), String> {
                 .to_string()
         });
 
-    let mut full_text = String::new();
-
-    // Iterate through all spine items/resources
+    let mut sections = Vec::new();
     let len = doc.get_num_chapters();
-    for _ in 0..len {
+
+    for chapter_idx in 0..len {
         if let Some((content, _mime)) = doc.get_current_str() {
             let clean = strip_html_tags(&content);
             if !clean.trim().is_empty() {
-                full_text.push_str(&clean);
-                full_text.push_str("\n\n");
+                // Try to extract chapter heading from the HTML, else fallback
+                let chapter_title = extract_heading(&content)
+                    .unwrap_or_else(|| format!("Chapter {}", chapter_idx + 1));
+
+                sections.push(ExtractedSection {
+                    title: chapter_title,
+                    content: clean,
+                });
             }
         }
         if !doc.go_next() {
@@ -30,11 +41,41 @@ pub fn extract_epub_text(path: &Path) -> Result<(String, String), String> {
         }
     }
 
-    if full_text.trim().is_empty() {
+    if sections.is_empty() {
         return Err("EPUB file contains no readable text content".to_string());
     }
 
+    Ok((title, sections))
+}
+
+pub fn extract_epub_text(path: &Path) -> Result<(String, String), String> {
+    let (title, sections) = extract_epub_sections(path)?;
+    let full_text = sections.into_iter()
+        .map(|s| s.content)
+        .collect::<Vec<_>>()
+        .join("\n\n");
     Ok((title, full_text))
+}
+
+fn extract_heading(html: &str) -> Option<String> {
+    // Look for <h1>...</h1> or <h2>...</h2> or <title>...</title>
+    for tag in ["h1", "h2", "title"] {
+        let open_tag = format!("<{}", tag);
+        let close_tag = format!("</{}>", tag);
+        if let Some(start_pos) = html.to_ascii_lowercase().find(&open_tag) {
+            if let Some(content_start) = html[start_pos..].find('>') {
+                let actual_start = start_pos + content_start + 1;
+                if let Some(end_pos) = html[actual_start..].to_ascii_lowercase().find(&close_tag) {
+                    let heading_raw = &html[actual_start..actual_start + end_pos];
+                    let clean = strip_html_tags(heading_raw).trim().to_string();
+                    if !clean.is_empty() && clean.len() < 120 {
+                        return Some(clean);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 pub fn strip_html_tags(html: &str) -> String {

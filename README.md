@@ -12,7 +12,7 @@ A high-performance, distraction-free desktop speed reader written in **Rust** de
 
 When you have trouble focusing, traditional reading forces your eyes to jump back and forth across wide margins (saccades). Each jump is an opportunity for your mind to wander, lose track, or get stuck re-reading the same paragraph.
 
-Speed Reader solves this with two dedicated focus modes:
+Speed Reader solves this with dedicated focus features:
 
 ### 1. ≡ Line-by-Line Mode (Recommended for Focus)
 * Shows **one focused thought / line at a time** in large, crisp typography.
@@ -25,13 +25,26 @@ Speed Reader solves this with two dedicated focus modes:
 * **Optimal Recognition Point (ORP)**: Calculates the exact eye-fixation point of every word and highlights it in a vivid accent color (coral / amber / cyan) between top and bottom alignment ticks. Your eyes never have to move!
 * Upcoming preview line below keeps you contextually aware.
 
-### 3. 🧠 Smart Punctuation Pausing
+### 3. 📑 PDF Page & EPUB Chapter Selector
+* **Start at any Page or Chapter**: Click the section badge in the header or press <kbd>P</kbd> to open the navigator.
+* **Direct Page Jump**: Enter any page number (e.g., jump straight to Page 24 of 80).
+* **Search Filter**: Search chapter titles with real-time filtering.
+* **Quick Steppers**: Jump to previous / next chapter with <kbd>[</kbd> and <kbd>]</kbd> or the header buttons.
+
+### 4. 📚 Reading Library & File Removal
+* **Recent Books Manager**: Click **📚 Library** or press <kbd>B</kbd> to view your reading shelf.
+* **Remove Files**: Remove books you are no longer interested in with the red **🗑 Remove** button.
+* **Clear History**: Clear old books at any time with one click.
+* **Resume Progress**: Shows your exact percentage, current word, and last-read timestamp.
+
+### 5. 🧠 Smart Punctuation Pausing
 * Naturally pauses slightly longer on periods (`.`, `!`, `?`) and paragraph ends (2.2x – 2.4x duration) so your brain has time to absorb sentence conclusions.
 * Micro-pauses on commas, semicolons, and dashes (`1.5x duration`).
 * Eliminates the "rushed feeling" and dramatically improves retention.
 
-### 4. ⛶ Zen / Focus Mode
-* Press `F` or `F11` to toggle **Zen Mode**: completely hides all buttons, sliders, progress bars, and header chrome.
+### 6. ⛶ Zen / Full Focus Mode
+* Starts **maximized** by default to fill your screen.
+* Press <kbd>F</kbd> or <kbd>F11</kbd> to toggle **Zen Mode**: completely hides all buttons, sliders, progress bars, and header chrome.
 * Leaves only you and the active text in pure, distraction-free isolation.
 
 ---
@@ -40,9 +53,9 @@ Speed Reader solves this with two dedicated focus modes:
 
 | Format | Extension | Capabilities |
 | :--- | :--- | :--- |
-| **PDF** | `.pdf` | Extracts clean text using `pdf-extract`, removes page artifacts, fixes hyphenated line wraps. |
-| **EPUB** | `.epub` | Parses eBooks chapter-by-chapter, strips HTML/CSS tags, decodes special entities (`&mdash;`, quotes, unicode). |
-| **Text & Markdown** | `.txt`, `.md`, `.text` | UTF-8 support with lossy fallback for any plain text file. |
+| **PDF** | `.pdf` | Extracts clean text by page, allowing you to select and jump to any page number. |
+| **EPUB** | `.epub` | Parses eBooks chapter-by-chapter, extracts headings, strips HTML tags, and decodes entities. |
+| **Text & Markdown** | `.txt`, `.md`, `.text` | Automatically detects markdown headings (`#`) or comfortable semantic sections. |
 | **Built-in Demo** | *Built-in* | Interactive onboarding guide loaded on first launch so you can start reading immediately! |
 
 > **Drag & Drop**: Simply drag and drop any `.pdf`, `.epub`, or `.txt` file anywhere into the window to load it immediately!
@@ -57,12 +70,15 @@ Speed Reader solves this with two dedicated focus modes:
 | <kbd>←</kbd> / <kbd>H</kbd> | Step back 1 line / word |
 | <kbd>→</kbd> / <kbd>L</kbd> | Step forward 1 line / word |
 | <kbd>Shift</kbd> + <kbd>←</kbd> / <kbd>→</kbd> | Jump 10 lines / words backward / forward |
+| <kbd>[</kbd> / <kbd>]</kbd> | Jump to **Previous / Next Chapter or Page** |
+| <kbd>P</kbd> | Open **Chapter / Page Selector** (Direct page jump + list) |
+| <kbd>B</kbd> | Open **Library Manager** (Resume or **Remove Books**) |
 | <kbd>↑</kbd> / <kbd>K</kbd> | Increase speed (+25 WPM) |
 | <kbd>↓</kbd> / <kbd>J</kbd> | Decrease speed (-25 WPM) |
 | <kbd>M</kbd> | Switch between **Line Mode** and **Word RSVP Mode** |
 | <kbd>F</kbd> / <kbd>F11</kbd> | Toggle **Zen Focus Mode** (hides all UI chrome) |
 | <kbd>R</kbd> | Rewind to beginning of book |
-| <kbd>Esc</kbd> | Exit Zen Mode / Pause |
+| <kbd>Esc</kbd> | Close modals / Exit Zen Mode / Pause |
 
 ---
 
@@ -73,14 +89,6 @@ Select your preferred reading ambiance from the top-right dropdown or customize 
 * **Warm Sepia**: Gentle parchment cream (`#F8F1E3`) with espresso text and burnt terracotta accents (ideal for daytime reading).
 * **Midnight OLED**: Pure black (`#000000`) for zero-light environments and battery saving, with electric cyan accents.
 * **High Contrast**: Vivid amber-yellow text on deep black for maximum readability and visual accessibility.
-
----
-
-## 💾 Automatic Bookmarking & Progress Persistence
-
-* Your reading position (`word_index`, `line_index`, `total_words`, `progress %`, and preferred `WPM`) is **automatically saved** per file to `speed_reader_config.json`.
-* When you reopen any previously opened book, Speed Reader automatically resumes at the exact line and speed you left off.
-* Use the **Recent Books** dropdown in the header to jump between books instantly.
 
 ---
 

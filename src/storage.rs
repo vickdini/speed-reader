@@ -129,4 +129,14 @@ impl AppConfig {
     pub fn get_bookmark(&self, path: &Path) -> Option<&BookBookmark> {
         self.recent_books.iter().find(|b| b.file_path == path)
     }
+
+    pub fn remove_bookmark(&mut self, path: &Path) {
+        self.recent_books.retain(|b| b.file_path != path);
+        self.save();
+    }
+
+    pub fn clear_bookmarks(&mut self) {
+        self.recent_books.clear();
+        self.save();
+    }
 }
