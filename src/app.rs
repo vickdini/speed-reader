@@ -5,7 +5,7 @@ use egui::{
     ScrollArea, Stroke, StrokeKind, TextEdit,
 };
 
-use crate::parser::load_document_sections;
+use crate::parser::load_document_sections_with_mode;
 use crate::reader::{Document, ReadingLine, Token};
 use crate::storage::{AppConfig, AppTheme, ReadingMode};
 
@@ -27,6 +27,9 @@ pub struct SpeedReaderApp {
     pub modal_error: Option<String>,
     pub first_frame: bool,
     pub status_message: Option<(String, Instant)>,
+    pub scroll_accumulator: f32,
+    pub last_scroll_time: Instant,
+    pub image_textures: std::collections::HashMap<String, egui::TextureHandle>,
 }
 
 impl SpeedReaderApp {
@@ -41,11 +44,10 @@ impl SpeedReaderApp {
 
         if let Some(recent) = config.recent_books.first().cloned() {
             if recent.file_path.exists() {
-                if let Ok((title, sections)) = load_document_sections(&recent.file_path) {
-                    document = Document::from_sections(
-                        title,
+                if let Ok(parsed) = load_document_sections_with_mode(&recent.file_path, config.epub_by_page) {
+                    document = Document::from_parsed_document(
+                        parsed,
                         Some(recent.file_path.clone()),
-                        sections,
                         config.words_per_line,
                     );
                     word_idx = recent.word_index.min(document.total_words.saturating_sub(1));
@@ -79,6 +81,9 @@ impl SpeedReaderApp {
             modal_error: None,
             first_frame: true,
             status_message: None,
+            scroll_accumulator: 0.0,
+            last_scroll_time: Instant::now(),
+            image_textures: std::collections::HashMap::new(),
         }
     }
 
@@ -87,16 +92,17 @@ impl SpeedReaderApp {
     }
 
     pub fn open_file(&mut self, path: PathBuf) {
-        match load_document_sections(&path) {
-            Ok((title, sections)) => {
-                let section_count = sections.len();
-                let is_pdf = sections.iter().any(|s| s.title.starts_with("Page "));
+        self.image_textures.clear();
+        match load_document_sections_with_mode(&path, self.config.epub_by_page) {
+            Ok(parsed) => {
+                let section_count = parsed.sections.len();
+                let is_pdf = parsed.sections.iter().any(|s| s.title.starts_with("Page "));
                 let section_type = if is_pdf { "pages" } else { "chapters" };
+                let doc_title = parsed.title.clone();
 
-                let doc = Document::from_sections(
-                    title.clone(),
+                let doc = Document::from_parsed_document(
+                    parsed,
                     Some(path.clone()),
-                    sections,
                     self.config.words_per_line,
                 );
                 let bookmark = self.config.get_bookmark(&path).cloned();
@@ -114,7 +120,7 @@ impl SpeedReaderApp {
                     self.config.active_mode = bm.mode;
                     self.set_status(format!(
                         "Resumed '{}' at {:.1}% ({} {})",
-                        title,
+                        doc_title,
                         self.progress_pct(),
                         section_count,
                         section_type
@@ -125,7 +131,7 @@ impl SpeedReaderApp {
                     self.paragraph_index = 0;
                     self.set_status(format!(
                         "Loaded '{}' ({} {}, {} words)",
-                        title,
+                        doc_title,
                         section_count,
                         section_type,
                         self.document.total_words
@@ -239,7 +245,7 @@ impl SpeedReaderApp {
             return 0.0;
         }
         match self.config.active_mode {
-            ReadingMode::Line => {
+            ReadingMode::Line | ReadingMode::Page => {
                 if self.document.total_lines == 0 {
                     0.0
                 } else {
@@ -306,7 +312,7 @@ impl SpeedReaderApp {
                 };
                 base_word_ms * multiplier
             }
-            ReadingMode::Line => {
+            ReadingMode::Line | ReadingMode::Page => {
                 if let Some(line) = self.current_line() {
                     let word_count = (line.word_indices.end - line.word_indices.start).max(1) as f32;
                     let multiplier = if self.config.smart_pause {
@@ -337,7 +343,7 @@ impl SpeedReaderApp {
 
     pub fn step_forward(&mut self) {
         match self.config.active_mode {
-            ReadingMode::Line => {
+            ReadingMode::Line | ReadingMode::Page => {
                 if self.line_index + 1 < self.document.total_lines {
                     self.line_index += 1;
                     self.word_index = self.document.word_for_line(self.line_index);
@@ -372,7 +378,7 @@ impl SpeedReaderApp {
 
     pub fn step_backward(&mut self) {
         match self.config.active_mode {
-            ReadingMode::Line => {
+            ReadingMode::Line | ReadingMode::Page => {
                 if self.line_index > 0 {
                     self.line_index -= 1;
                     self.word_index = self.document.word_for_line(self.line_index);
@@ -398,7 +404,7 @@ impl SpeedReaderApp {
 
     pub fn jump_steps(&mut self, count: isize) {
         match self.config.active_mode {
-            ReadingMode::Line => {
+            ReadingMode::Line | ReadingMode::Page => {
                 let new_idx = (self.line_index as isize + count)
                     .max(0)
                     .min(self.document.total_lines.saturating_sub(1) as isize) as usize;
@@ -428,7 +434,7 @@ impl SpeedReaderApp {
     pub fn jump_to_progress(&mut self, pct: f32) {
         let clamped = (pct / 100.0).clamp(0.0, 1.0);
         match self.config.active_mode {
-            ReadingMode::Line => {
+            ReadingMode::Line | ReadingMode::Page => {
                 let target = ((self.document.total_lines as f32) * clamped).floor() as usize;
                 self.line_index = target.min(self.document.total_lines.saturating_sub(1));
                 self.word_index = self.document.word_for_line(self.line_index);
@@ -460,13 +466,13 @@ impl SpeedReaderApp {
     }
 
     pub fn rebuild_document_lines(&mut self) {
+        self.image_textures.clear();
         if let Some(path) = self.document.file_path.clone() {
-            if let Ok((title, sections)) = load_document_sections(&path) {
+            if let Ok(parsed) = load_document_sections_with_mode(&path, self.config.epub_by_page) {
                 let cur_word = self.word_index;
-                self.document = Document::from_sections(
-                    title,
+                self.document = Document::from_parsed_document(
+                    parsed,
                     Some(path),
-                    sections,
                     self.config.words_per_line,
                 );
                 self.word_index = cur_word.min(self.document.total_words.saturating_sub(1));
@@ -573,14 +579,24 @@ impl eframe::App for SpeedReaderApp {
             }
         }
 
+        // Mouse wheel scroll delta
+        let (raw_scroll_y, smooth_scroll_y) = ctx.input(|i| (i.raw_scroll_delta.y, i.smooth_scroll_delta.y));
+        let scroll_y = if raw_scroll_y.abs() > 0.01 {
+            raw_scroll_y
+        } else {
+            smooth_scroll_y
+        };
+
         // Handle keyboard shortcuts
         let input = ctx.input(|i| {
             (
                 i.key_pressed(Key::Space),
                 i.key_pressed(Key::ArrowLeft) || i.key_pressed(Key::H),
                 i.key_pressed(Key::ArrowRight) || i.key_pressed(Key::L),
-                i.key_pressed(Key::ArrowUp) || i.key_pressed(Key::K),
-                i.key_pressed(Key::ArrowDown) || i.key_pressed(Key::J),
+                i.key_pressed(Key::ArrowUp),
+                i.key_pressed(Key::ArrowDown),
+                i.key_pressed(Key::PageUp),
+                i.key_pressed(Key::PageDown),
                 i.key_pressed(Key::F) || i.key_pressed(Key::F11),
                 i.key_pressed(Key::M),
                 i.key_pressed(Key::R),
@@ -589,11 +605,55 @@ impl eframe::App for SpeedReaderApp {
                 i.key_pressed(Key::B),
                 i.key_pressed(Key::OpenBracket),
                 i.key_pressed(Key::CloseBracket),
+                i.key_pressed(Key::K),
+                i.key_pressed(Key::J),
+                i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals),
+                i.key_pressed(Key::Minus),
                 i.modifiers.shift,
+                i.modifiers.ctrl,
             )
         });
 
-        let (space, left, right, up, down, key_f, key_m, key_r, esc, key_p, key_b, open_bracket, close_bracket, shift) = input;
+        let (
+            space,
+            left,
+            right,
+            up,
+            down,
+            page_up,
+            page_down,
+            key_f,
+            key_m,
+            key_r,
+            esc,
+            key_p,
+            key_b,
+            open_bracket,
+            close_bracket,
+            key_k,
+            key_j,
+            plus,
+            minus,
+            shift,
+            ctrl,
+        ) = input;
+
+        // Mouse wheel scrolling: scroll line by line up and down
+        if scroll_y.abs() > 0.1 && !self.show_chapter_modal && !self.show_library_modal && !self.show_settings {
+            self.last_scroll_time = Instant::now();
+            self.scroll_accumulator += scroll_y;
+            let threshold = 50.0;
+            while self.scroll_accumulator <= -threshold {
+                self.step_forward();
+                self.scroll_accumulator += threshold;
+            }
+            while self.scroll_accumulator >= threshold {
+                self.step_backward();
+                self.scroll_accumulator -= threshold;
+            }
+        } else if self.last_scroll_time.elapsed().as_millis() > 180 {
+            self.scroll_accumulator = 0.0;
+        }
 
         if space {
             self.toggle_play();
@@ -613,21 +673,54 @@ impl eframe::App for SpeedReaderApp {
             }
         }
         if up {
+            if shift || ctrl {
+                self.config.wpm = (self.config.wpm + 25).min(1200);
+                self.set_status(format!("Speed: {} WPM", self.config.wpm));
+                self.config.save();
+            } else {
+                self.step_backward();
+            }
+        }
+        if down {
+            if shift || ctrl {
+                self.config.wpm = self.config.wpm.saturating_sub(25).max(60);
+                self.set_status(format!("Speed: {} WPM", self.config.wpm));
+                self.config.save();
+            } else {
+                self.step_forward();
+            }
+        }
+        if key_k || plus {
             self.config.wpm = (self.config.wpm + 25).min(1200);
             self.set_status(format!("Speed: {} WPM", self.config.wpm));
             self.config.save();
         }
-        if down {
+        if key_j || minus {
             self.config.wpm = self.config.wpm.saturating_sub(25).max(60);
             self.set_status(format!("Speed: {} WPM", self.config.wpm));
             self.config.save();
+        }
+        if page_up {
+            if self.config.active_mode == ReadingMode::Page {
+                self.jump_to_prev_section();
+            } else {
+                self.jump_steps(-10);
+            }
+        }
+        if page_down {
+            if self.config.active_mode == ReadingMode::Page {
+                self.jump_to_next_section();
+            } else {
+                self.jump_steps(10);
+            }
         }
         if key_f {
             self.zen_mode = !self.zen_mode;
         }
         if key_m {
             self.config.active_mode = match self.config.active_mode {
-                ReadingMode::Line => ReadingMode::Paragraph,
+                ReadingMode::Line => ReadingMode::Page,
+                ReadingMode::Page => ReadingMode::Paragraph,
                 ReadingMode::Paragraph => ReadingMode::WordRsvp,
                 ReadingMode::WordRsvp => ReadingMode::Line,
             };
@@ -635,6 +728,7 @@ impl eframe::App for SpeedReaderApp {
                 "Mode: {}",
                 match self.config.active_mode {
                     ReadingMode::Line => "Line-by-Line",
+                    ReadingMode::Page => "Page",
                     ReadingMode::Paragraph => "Paragraph",
                     ReadingMode::WordRsvp => "Word RSVP",
                 }
@@ -803,18 +897,23 @@ impl eframe::App for SpeedReaderApp {
                             // Mode Switcher Buttons
                             ui.horizontal(|ui| {
                                 let line_active = self.config.active_mode == ReadingMode::Line;
+                                let page_active = self.config.active_mode == ReadingMode::Page;
                                 let para_active = self.config.active_mode == ReadingMode::Paragraph;
                                 let rsvp_active = self.config.active_mode == ReadingMode::WordRsvp;
 
-                                if ui.selectable_label(line_active, "≡ Line").clicked() {
+                                if ui.selectable_label(line_active, "≡ Line").on_hover_text("Read one line at a time (M)").clicked() {
                                     self.config.active_mode = ReadingMode::Line;
                                     self.config.save();
                                 }
-                                if ui.selectable_label(para_active, "¶ Paragraph").clicked() {
+                                if ui.selectable_label(page_active, "📄 Page").on_hover_text("Read by page with line-by-line scrolling (M)").clicked() {
+                                    self.config.active_mode = ReadingMode::Page;
+                                    self.config.save();
+                                }
+                                if ui.selectable_label(para_active, "¶ Paragraph").on_hover_text("Read paragraph at a time (M)").clicked() {
                                     self.config.active_mode = ReadingMode::Paragraph;
                                     self.config.save();
                                 }
-                                if ui.selectable_label(rsvp_active, "✦ Word RSVP").clicked() {
+                                if ui.selectable_label(rsvp_active, "✦ Word RSVP").on_hover_text("Spritz-style word RSVP (M)").clicked() {
                                     self.config.active_mode = ReadingMode::WordRsvp;
                                     self.config.save();
                                 }
@@ -847,6 +946,7 @@ impl eframe::App for SpeedReaderApp {
                             let sec_type = self.document.section_type_label();
                             let stats_text = match self.config.active_mode {
                                 ReadingMode::Line => format!("{}/{} lines | {} {}/{}", self.line_index + 1, self.document.total_lines, sec_type, cur_sec_idx + 1, self.document.sections.len()),
+                                ReadingMode::Page => format!("Page {}/{} (line {}/{})", cur_sec_idx + 1, self.document.sections.len(), self.line_index + 1, self.document.total_lines),
                                 ReadingMode::Paragraph => format!("{}/{} paragraphs | {} {}/{}", self.paragraph_index + 1, self.document.total_paragraphs, sec_type, cur_sec_idx + 1, self.document.sections.len()),
                                 ReadingMode::WordRsvp => format!("{}/{} words | {} {}/{}", self.word_index + 1, self.document.total_words, sec_type, cur_sec_idx + 1, self.document.sections.len()),
                             };
@@ -1140,7 +1240,7 @@ impl eframe::App for SpeedReaderApp {
 
                                             let stats = match book.mode {
                                                 ReadingMode::Paragraph => format!("{:.1}% read (para {} of {}, {} words)", pct, book.paragraph_index + 1, book.total_paragraphs, book.total_words),
-                                                ReadingMode::Line => format!("{:.1}% read (line {} of {}, {} words)", pct, book.line_index + 1, book.total_lines, book.total_words),
+                                                ReadingMode::Line | ReadingMode::Page => format!("{:.1}% read (line {} of {}, {} words)", pct, book.line_index + 1, book.total_lines, book.total_words),
                                                 ReadingMode::WordRsvp => format!("{:.1}% read (word {} of {})", pct, book.word_index + 1, book.total_words),
                                             };
                                             ui.label(RichText::new(stats).color(colors.text_secondary).size(11.0));
@@ -1238,6 +1338,21 @@ impl eframe::App for SpeedReaderApp {
                             .size(11.0),
                     );
 
+                    ui.add_space(12.0);
+
+                    // Paginate EPUB by page setting
+                    let mut ep = self.config.epub_by_page;
+                    if ui.checkbox(&mut ep, "Paginate EPUB by Page").changed() {
+                        self.config.epub_by_page = ep;
+                        self.rebuild_document_lines();
+                        self.config.save();
+                    }
+                    ui.label(
+                        RichText::new("Splits EPUB documents into readable pages (~250 words) with page numbers, enabling direct page jump and page-by-page reading.")
+                            .color(colors.text_faint)
+                            .size(11.0),
+                    );
+
                     ui.add_space(16.0);
                     ui.separator();
 
@@ -1246,14 +1361,15 @@ impl eframe::App for SpeedReaderApp {
                     ui.heading(RichText::new("⌨ Shortcuts").color(colors.text_primary).size(14.0));
                     let shortcuts = [
                         ("Space", "Play / Pause"),
-                        ("← / H", "Step Back"),
-                        ("→ / L", "Step Forward"),
+                        ("↑ / ↓ or Wheel", "Scroll Line-by-Line Up / Down"),
+                        ("← / → or H / L", "Step Back / Forward"),
                         ("Shift + ←/→", "Jump 10 Words/Lines/Paras"),
+                        ("Shift + ↑/↓ or +/-", "Adjust Speed (+/- 25 WPM)"),
+                        ("PageUp / PageDown", "Previous / Next Page"),
                         ("[ / ]", "Prev / Next Chapter or Page"),
                         ("P", "Select Chapter / Page"),
                         ("B", "Manage Library & History"),
-                        ("↑ / ↓", "+25 / -25 WPM Speed"),
-                        ("M", "Cycle Line / Paragraph / RSVP"),
+                        ("M", "Cycle Line / Page / Para / RSVP"),
                         ("F / F11", "Toggle Zen Focus Mode"),
                         ("R", "Rewind to Start"),
                         ("Esc", "Close Modals / Exit Zen"),
@@ -1277,6 +1393,9 @@ impl eframe::App for SpeedReaderApp {
                 match self.config.active_mode {
                     ReadingMode::Line => {
                         self.render_line_mode(ui, rect, center, &colors);
+                    }
+                    ReadingMode::Page => {
+                        self.render_page_mode(ui, rect, center, &colors);
                     }
                     ReadingMode::Paragraph => {
                         self.render_paragraph_mode(ui, rect, center, &colors);
@@ -1370,6 +1489,299 @@ impl SpeedReaderApp {
         }
     }
 
+    fn render_page_mode(&mut self, ui: &mut egui::Ui, rect: egui::Rect, center: egui::Pos2, colors: &ThemeColors) {
+        let card_width = (rect.width() * 0.90).clamp(520.0, 960.0);
+        let card_height = (rect.height() * 0.82).clamp(320.0, 760.0);
+        let card_rect = egui::Rect::from_center_size(center, vec2(card_width, card_height));
+
+        // Soft accent glow around card
+        ui.painter().rect_stroke(
+            card_rect.expand(2.0),
+            CornerRadius::same(14),
+            Stroke::new(1.0_f32, colors.accent_glow),
+            StrokeKind::Outside,
+        );
+
+        // Card surface background & border
+        ui.painter().rect_filled(card_rect, CornerRadius::same(12), colors.surface);
+        ui.painter().rect_stroke(
+            card_rect,
+            CornerRadius::same(12),
+            Stroke::new(1.0_f32, colors.border),
+            StrokeKind::Inside,
+        );
+
+        // Accent guide on left edge
+        let guide_rect = egui::Rect::from_min_max(
+            card_rect.left_top() + vec2(0.0, 12.0),
+            card_rect.left_bottom() + vec2(4.0, -12.0),
+        );
+        ui.painter().rect_filled(guide_rect, CornerRadius::same(2), colors.accent);
+
+        // Inner content area
+        let inner_rect = card_rect.shrink2(vec2(28.0, 18.0));
+        let cur_sec_idx = self.document.current_section_index(self.word_index);
+        let cur_sec = self.document.sections.get(cur_sec_idx);
+        let cur_sec_title = cur_sec
+            .map(|s| s.title.as_str())
+            .unwrap_or("Page 1");
+
+        let start_line_idx = cur_sec.map(|s| s.start_line_index).unwrap_or(0);
+        let line_count = cur_sec.map(|s| s.line_count).unwrap_or(self.document.lines.len());
+        let end_line_idx = (start_line_idx + line_count).min(self.document.lines.len());
+
+        let line_font_size = (self.config.font_size * 0.52).clamp(16.0, 24.0);
+        let row_height = line_font_size * 1.6;
+
+        let mut clicked_line = None;
+        let mut jump_prev_page = false;
+        let mut jump_next_page = false;
+
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inner_rect), |ui| {
+            ui.vertical(|ui| {
+                // Header badge row inside the card
+                ui.horizontal(|ui| {
+                    let sec_type_label = self.document.section_type_label().to_uppercase();
+                    ui.label(
+                        RichText::new(format!("📄 {} {} / {}", sec_type_label, cur_sec_idx + 1, self.document.sections.len()))
+                            .color(colors.accent)
+                            .strong()
+                            .size(13.0),
+                    );
+
+                    ui.label(
+                        RichText::new(format!("• {}", truncate_str(cur_sec_title, 34)))
+                            .color(colors.text_secondary)
+                            .size(12.0),
+                    );
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if cur_sec_idx + 1 < self.document.sections.len() {
+                            if ui.button(RichText::new("Next Page ⏭").size(11.0).color(colors.accent)).clicked() {
+                                jump_next_page = true;
+                            }
+                        }
+                        if cur_sec_idx > 0 {
+                            if ui.button(RichText::new("⏮ Prev Page").size(11.0).color(colors.text_secondary)).clicked() {
+                                jump_prev_page = true;
+                            }
+                        }
+
+                        let line_in_sec = self.line_index.saturating_sub(start_line_idx) + 1;
+                        ui.label(
+                            RichText::new(format!("Line {} / {} on page", line_in_sec.min(line_count), line_count.max(1)))
+                                .color(colors.text_faint)
+                                .size(11.0),
+                        );
+                    });
+                });
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                // Page Lines with vertical scroll and line focus
+                ScrollArea::vertical()
+                    .id_salt("page_lines_scroll_area")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let page_image = self.document.paragraphs.iter()
+                            .find(|p| p.image.is_some() && (start_line_idx..end_line_idx).any(|l| p.line_indices.contains(&l)))
+                            .and_then(|p| p.image.as_ref());
+
+                        if let Some(img) = page_image {
+                            if end_line_idx.saturating_sub(start_line_idx) <= 4 {
+                                if let Some(texture) = Self::get_or_load_image_texture(
+                                    &mut self.image_textures,
+                                    ui.ctx(),
+                                    &self.document.images,
+                                    &img.image_id,
+                                ) {
+                                    let tex_size = texture.size_vec2();
+                                    let avail_w = ui.available_width().max(100.0);
+                                    let avail_h = (card_rect.height() - 100.0).max(150.0);
+                                    let max_w = (avail_w - 40.0).clamp(160.0, 520.0);
+                                    let max_h = (avail_h - 40.0).clamp(180.0, 540.0);
+                                    let scale = (max_w / tex_size.x).min(max_h / tex_size.y).min(1.0);
+                                    let display_size = tex_size * scale;
+
+                                    ui.vertical_centered(|ui| {
+                                        ui.add(
+                                            egui::Image::new(&texture)
+                                                .fit_to_exact_size(display_size)
+                                                .corner_radius(8),
+                                        );
+                                        ui.add_space(8.0);
+                                        let caption_text = img.caption.as_deref().or(img.alt.as_deref());
+                                        if let Some(caption) = caption_text {
+                                            ui.label(
+                                                RichText::new(caption)
+                                                    .color(colors.text_secondary)
+                                                    .italics()
+                                                    .size(12.0),
+                                            );
+                                        }
+                                    });
+                                    ui.add_space(10.0);
+                                }
+                            }
+                        }
+
+                        for idx in start_line_idx..end_line_idx {
+                            if idx >= self.document.lines.len() {
+                                break;
+                            }
+                            let is_active = idx == self.line_index;
+                            let line = &self.document.lines[idx];
+
+                            let (rect, resp) = ui.allocate_exact_size(
+                                vec2(ui.available_width(), row_height),
+                                egui::Sense::click(),
+                            );
+
+                            if resp.clicked() {
+                                clicked_line = Some(idx);
+                            }
+
+                            if is_active {
+                                resp.scroll_to_me(Some(Align::Center));
+
+                                // Active line highlight background
+                                ui.painter().rect_filled(
+                                    rect,
+                                    CornerRadius::same(6),
+                                    colors.accent.gamma_multiply(0.14),
+                                );
+                                ui.painter().rect_stroke(
+                                    rect,
+                                    CornerRadius::same(6),
+                                    Stroke::new(1.0_f32, colors.accent.gamma_multiply(0.4)),
+                                    StrokeKind::Inside,
+                                );
+
+                                // Active line left pill marker
+                                let pill = egui::Rect::from_min_max(
+                                    rect.left_top() + vec2(2.0, 3.0),
+                                    rect.left_bottom() + vec2(5.0, -3.0),
+                                );
+                                ui.painter().rect_filled(pill, CornerRadius::same(1), colors.accent);
+                            } else if resp.hovered() {
+                                ui.painter().rect_filled(
+                                    rect,
+                                    CornerRadius::same(6),
+                                    colors.text_faint.gamma_multiply(0.08),
+                                );
+                            }
+
+                            let text_pos = egui::pos2(
+                                rect.left() + if is_active { 12.0 } else { 8.0 },
+                                rect.center().y,
+                            );
+
+                            let text_color = if is_active {
+                                colors.text_primary
+                            } else {
+                                colors.text_secondary
+                            };
+
+                            let font = if is_active {
+                                FontId::proportional(line_font_size + 0.5)
+                            } else {
+                                FontId::proportional(line_font_size)
+                            };
+
+                            let display_line_text = if line.text.starts_with("[Illustration:") || line.text.starts_with("[Image:") {
+                                format!("🖼 {}", line.text)
+                            } else if line.text.starts_with("[Table") {
+                                format!("📊 {}", line.text)
+                            } else {
+                                line.text.clone()
+                            };
+
+                            ui.painter().text(
+                                text_pos,
+                                Align2::LEFT_CENTER,
+                                display_line_text,
+                                font,
+                                text_color,
+                            );
+                        }
+                    });
+            });
+        });
+
+        if let Some(target) = clicked_line {
+            self.line_index = target;
+            self.word_index = self.document.word_for_line(target);
+            self.paragraph_index = self.document.paragraph_for_word(self.word_index);
+        }
+        if jump_prev_page {
+            self.jump_to_prev_section();
+        }
+        if jump_next_page {
+            self.jump_to_next_section();
+        }
+
+        // Reading playback progress indicator bar at bottom edge of card
+        if self.is_playing {
+            let elapsed_ms = self.last_tick.elapsed().as_secs_f32() * 1000.0;
+            let progress = (elapsed_ms / self.step_duration_ms).clamp(0.0, 1.0);
+            let bar_height = 3.5;
+            let bar_rect = egui::Rect::from_min_max(
+                card_rect.left_bottom() + vec2(12.0, -bar_height - 4.0),
+                egui::pos2(
+                    card_rect.left() + 12.0 + (card_rect.width() - 24.0) * progress,
+                    card_rect.bottom() - 4.0,
+                ),
+            );
+            ui.painter().rect_filled(bar_rect, CornerRadius::same(2), colors.accent);
+        }
+    }
+
+fn get_or_load_image_texture(
+    image_textures: &mut std::collections::HashMap<String, egui::TextureHandle>,
+    ctx: &egui::Context,
+    images: &std::collections::HashMap<String, Vec<u8>>,
+    image_id: &str,
+) -> Option<egui::TextureHandle> {
+    if let Some(tex) = image_textures.get(image_id) {
+        return Some(tex.clone());
+    }
+
+    let bytes = images.get(image_id)
+        .or_else(|| {
+            let filename = std::path::Path::new(image_id)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(image_id);
+            images.get(filename)
+        })
+        .or_else(|| {
+            if image_id.to_lowercase().contains("cover") {
+                images.get("cover")
+            } else {
+                None
+            }
+        });
+
+    if let Some(raw_bytes) = bytes {
+        if let Ok(dyn_img) = image::load_from_memory(raw_bytes) {
+            let rgba = dyn_img.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &rgba.into_raw());
+            let handle = ctx.load_texture(
+                format!("tex_{}", image_id),
+                color_image,
+                egui::TextureOptions::LINEAR,
+            );
+            image_textures.insert(image_id.to_string(), handle.clone());
+            return Some(handle);
+        }
+    }
+
+    None
+}
+
     fn render_paragraph_mode(&mut self, ui: &mut egui::Ui, rect: egui::Rect, center: egui::Pos2, colors: &ThemeColors) {
         // Responsive card dimensions
         let card_width = (rect.width() * 0.88).clamp(500.0, 920.0);
@@ -1429,8 +1841,13 @@ impl SpeedReaderApp {
         let inner_rect = card_rect.shrink2(vec2(28.0, 20.0));
         let cur_sec_idx = self.document.current_section_index(self.word_index);
         let cur_sec_title = self.document.sections.get(cur_sec_idx)
-            .map(|s| s.title.as_str())
-            .unwrap_or("Start");
+            .map(|s| s.title.clone())
+            .unwrap_or_else(|| "Start".to_string());
+
+        let current_para = self.current_paragraph().cloned();
+        let is_table = current_para.as_ref().map(|p| p.table.is_some()).unwrap_or(false);
+        let is_image = current_para.as_ref().map(|p| p.image.is_some()).unwrap_or(false);
+        let cur_para_word_count = current_para.as_ref().map(|p| p.word_indices.end.saturating_sub(p.word_indices.start)).unwrap_or(0);
 
         let para_font_size = (self.config.font_size * 0.65).clamp(18.0, 32.0);
 
@@ -1438,25 +1855,32 @@ impl SpeedReaderApp {
             ui.vertical(|ui| {
                 // Header badge row inside the card
                 ui.horizontal(|ui| {
+                    let badge_text = if is_table {
+                        format!("📊 TABLE • ¶ {} / {}", self.paragraph_index + 1, self.document.total_paragraphs)
+                    } else if is_image {
+                        format!("🖼 IMAGE • ¶ {} / {}", self.paragraph_index + 1, self.document.total_paragraphs)
+                    } else {
+                        format!("¶ PARAGRAPH {} / {}", self.paragraph_index + 1, self.document.total_paragraphs)
+                    };
+
                     ui.label(
-                        RichText::new(format!("¶ PARAGRAPH {} / {}", self.paragraph_index + 1, self.document.total_paragraphs))
+                        RichText::new(badge_text)
                             .color(colors.accent)
                             .strong()
                             .size(13.0),
                     );
 
                     ui.label(
-                        RichText::new(format!("• {}", truncate_str(cur_sec_title, 36)))
+                        RichText::new(format!("• {}", truncate_str(&cur_sec_title, 36)))
                             .color(colors.text_secondary)
                             .size(12.0),
                     );
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if let Some(para) = self.current_paragraph() {
-                            let word_count = para.word_indices.end.saturating_sub(para.word_indices.start);
-                            let duration_sec = (word_count as f32 / (self.config.wpm as f32 / 60.0)).max(0.5);
+                        if current_para.is_some() {
+                            let duration_sec = (cur_para_word_count as f32 / (self.config.wpm as f32 / 60.0)).max(0.5);
                             ui.label(
-                                RichText::new(format!("{} words • ~{:.1}s at {} WPM", word_count, duration_sec, self.config.wpm))
+                                RichText::new(format!("{} words • ~{:.1}s at {} WPM", cur_para_word_count, duration_sec, self.config.wpm))
                                     .color(colors.text_faint)
                                     .size(11.0),
                             );
@@ -1469,17 +1893,134 @@ impl SpeedReaderApp {
                 ui.add_space(12.0);
 
                 // Paragraph Text Content with vertical scroll if long
-                if let Some(para) = self.current_paragraph() {
-                    ScrollArea::vertical()
-                        .id_salt("paragraph_scroll_area")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            let rich_text = RichText::new(&para.text)
-                                .size(para_font_size)
-                                .color(colors.text_primary)
-                                .line_height(Some(para_font_size * 1.55));
-                            ui.label(rich_text);
-                        });
+                if let Some(para) = current_para {
+                    if let Some(ref table) = para.table {
+                        // Render Structured Table
+                        ScrollArea::both()
+                            .id_salt("paragraph_table_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.vertical(|ui| {
+                                    if let Some(ref cap) = table.caption {
+                                        ui.label(
+                                            RichText::new(cap)
+                                                .color(colors.accent)
+                                                .strong()
+                                                .size(15.0),
+                                        );
+                                        ui.add_space(8.0);
+                                    }
+
+                                    egui::Frame::canvas(ui.style())
+                                        .fill(colors.surface.gamma_multiply(0.7))
+                                        .stroke(Stroke::new(1.0_f32, colors.border))
+                                        .corner_radius(CornerRadius::same(6))
+                                        .inner_margin(Margin::same(10))
+                                        .show(ui, |ui| {
+                                            egui::Grid::new("reading_table_grid")
+                                                .striped(true)
+                                                .spacing(vec2(22.0, 10.0))
+                                                .min_col_width(50.0)
+                                                .show(ui, |ui| {
+                                                    if !table.headers.is_empty() {
+                                                        for h in &table.headers {
+                                                            ui.label(
+                                                                RichText::new(h)
+                                                                    .color(colors.accent)
+                                                                    .strong()
+                                                                    .size(13.5),
+                                                            );
+                                                        }
+                                                        ui.end_row();
+                                                    }
+
+                                                    for row in &table.rows {
+                                                        for cell in row {
+                                                            ui.label(
+                                                                RichText::new(cell)
+                                                                    .color(colors.text_primary)
+                                                                    .size(13.0),
+                                                            );
+                                                        }
+                                                        ui.end_row();
+                                                    }
+                                                });
+                                        });
+
+                                    if let Some(ref foot) = table.footer {
+                                        ui.add_space(8.0);
+                                        ui.label(
+                                            RichText::new(foot)
+                                                .color(colors.text_faint)
+                                                .italics()
+                                                .size(12.0),
+                                        );
+                                    }
+                                });
+                            });
+                    } else if let Some(ref img) = para.image {
+                        // Render Image (Cover or In-Chapter Figure)
+                        let tex = Self::get_or_load_image_texture(
+                            &mut self.image_textures,
+                            ui.ctx(),
+                            &self.document.images,
+                            &img.image_id,
+                        );
+
+                        ScrollArea::vertical()
+                            .id_salt("paragraph_image_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.vertical_centered(|ui| {
+                                    if let Some(texture) = tex {
+                                        let tex_size = texture.size_vec2();
+                                        let avail_w = ui.available_width().max(100.0);
+                                        let avail_h = ui.available_height().max(100.0);
+                                        let max_w = (avail_w - 30.0).clamp(160.0, 680.0);
+                                        let max_h = (avail_h - 50.0).clamp(180.0, 480.0);
+                                        let scale = (max_w / tex_size.x).min(max_h / tex_size.y).min(1.0);
+                                        let display_size = tex_size * scale;
+
+                                        ui.add(
+                                            egui::Image::new(&texture)
+                                                .fit_to_exact_size(display_size)
+                                                .corner_radius(8),
+                                        );
+                                        ui.add_space(10.0);
+                                    } else {
+                                        ui.add_space(30.0);
+                                        ui.label(
+                                            RichText::new(format!("🖼 [Image: {}]", img.image_id))
+                                                .color(colors.accent)
+                                                .size(16.0),
+                                        );
+                                        ui.add_space(20.0);
+                                    }
+
+                                    let caption_text = img.caption.as_deref().or(img.alt.as_deref());
+                                    if let Some(caption) = caption_text {
+                                        ui.label(
+                                            RichText::new(caption)
+                                                .color(colors.text_secondary)
+                                                .italics()
+                                                .size(13.0),
+                                        );
+                                    }
+                                });
+                            });
+                    } else {
+                        // Regular text paragraph
+                        ScrollArea::vertical()
+                            .id_salt("paragraph_scroll_area")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let rich_text = RichText::new(&para.text)
+                                    .size(para_font_size)
+                                    .color(colors.text_primary)
+                                    .line_height(Some(para_font_size * 1.55));
+                                ui.label(rich_text);
+                            });
+                    }
                 } else {
                     ui.vertical_centered(|ui| {
                         ui.add_space(40.0);

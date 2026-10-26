@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::Path;
-use super::epub::ExtractedSection;
+use crate::reader::ExtractedSection;
 
 pub fn extract_txt_sections(path: &Path) -> Result<(String, Vec<ExtractedSection>), String> {
     let bytes = fs::read(path).map_err(|e| format!("Failed to read file: {}", e))?;
@@ -28,10 +28,10 @@ pub fn extract_txt_sections(path: &Path) -> Result<(String, Vec<ExtractedSection
         // Check if markdown header
         if trimmed.starts_with("# ") || trimmed.starts_with("## ") || trimmed.starts_with("### ") {
             if !current_section_content.trim().is_empty() {
-                sections.push(ExtractedSection {
-                    title: current_section_title,
-                    content: current_section_content.clone(),
-                });
+                sections.push(ExtractedSection::new(
+                    current_section_title,
+                    current_section_content.clone(),
+                ));
                 current_section_content.clear();
             }
             let heading_text = trimmed.trim_start_matches('#').trim().to_string();
@@ -43,10 +43,10 @@ pub fn extract_txt_sections(path: &Path) -> Result<(String, Vec<ExtractedSection
     }
 
     if !current_section_content.trim().is_empty() {
-        sections.push(ExtractedSection {
-            title: current_section_title,
-            content: current_section_content,
-        });
+        sections.push(ExtractedSection::new(
+            current_section_title,
+            current_section_content,
+        ));
     }
 
     // If no markdown headings were found and the text is large, chunk by ~1200 words
@@ -57,17 +57,17 @@ pub fn extract_txt_sections(path: &Path) -> Result<(String, Vec<ExtractedSection
             let chunk_size = 1200;
             let mut chunk_idx = 1;
             for chunk in words.chunks(chunk_size) {
-                sections.push(ExtractedSection {
-                    title: format!("Section {}", chunk_idx),
-                    content: chunk.join(" "),
-                });
+                sections.push(ExtractedSection::new(
+                    format!("Section {}", chunk_idx),
+                    chunk.join(" "),
+                ));
                 chunk_idx += 1;
             }
         } else {
-            sections.push(ExtractedSection {
-                title: "Full Text".to_string(),
-                content: full_text,
-            });
+            sections.push(ExtractedSection::new(
+                "Full Text".to_string(),
+                full_text,
+            ));
         }
     }
 

@@ -1,6 +1,86 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use crate::parser::ExtractedSection;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReadingTable {
+    pub caption: Option<String>,
+    pub headers: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub footer: Option<String>,
+}
+
+impl ReadingTable {
+    pub fn to_text(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(ref cap) = self.caption {
+            parts.push(cap.clone());
+        }
+        if !self.headers.is_empty() {
+            parts.push(self.headers.join(" | "));
+        }
+        for row in &self.rows {
+            parts.push(row.join(" | "));
+        }
+        if let Some(ref foot) = self.footer {
+            parts.push(foot.clone());
+        }
+        parts.join("\n")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReadingImage {
+    pub image_id: String,
+    pub caption: Option<String>,
+    pub alt: Option<String>,
+}
+
+impl ReadingImage {
+    pub fn to_text(&self) -> String {
+        let desc = self.caption.as_deref().or(self.alt.as_deref()).unwrap_or("Illustration");
+        format!("[Illustration: {}]", desc)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SectionBlock {
+    Text(String),
+    Table(ReadingTable),
+    Image(ReadingImage),
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtractedSection {
+    pub title: String,
+    pub content: String,
+    pub blocks: Vec<SectionBlock>,
+}
+
+impl ExtractedSection {
+    pub fn new(title: String, content: String) -> Self {
+        Self {
+            title,
+            content,
+            blocks: Vec::new(),
+        }
+    }
+
+    pub fn with_blocks(title: String, content: String, blocks: Vec<SectionBlock>) -> Self {
+        Self {
+            title,
+            content,
+            blocks,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedDocument {
+    pub title: String,
+    pub sections: Vec<ExtractedSection>,
+    pub images: HashMap<String, Vec<u8>>,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Token {
@@ -87,6 +167,8 @@ pub struct ReadingParagraph {
     pub word_indices: std::ops::Range<usize>,
     pub line_indices: std::ops::Range<usize>,
     pub pause_multiplier: f32,
+    pub table: Option<ReadingTable>,
+    pub image: Option<ReadingImage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -113,6 +195,7 @@ pub struct Document {
     pub total_words: usize,
     pub total_lines: usize,
     pub total_paragraphs: usize,
+    pub images: HashMap<String, Vec<u8>>,
 }
 
 /// Helper function to split cleaned text into distinct paragraph blocks
@@ -148,86 +231,221 @@ impl Document {
         extracted_sections: Vec<ExtractedSection>,
         words_per_line: usize,
     ) -> Self {
+        Self::from_parsed_document(
+            ParsedDocument {
+                title,
+                sections: extracted_sections,
+                images: HashMap::new(),
+            },
+            file_path,
+            words_per_line,
+        )
+    }
+
+    pub fn from_parsed_document(
+        parsed: ParsedDocument,
+        file_path: Option<PathBuf>,
+        words_per_line: usize,
+    ) -> Self {
         let mut tokens = Vec::new();
         let mut lines = Vec::new();
         let mut paragraphs = Vec::new();
         let mut sections = Vec::new();
 
-        for sec in extracted_sections {
+        for sec in parsed.sections {
             let start_word_idx = tokens.len();
             let start_line_idx = lines.len();
             let start_para_idx = paragraphs.len();
 
-            let cleaned = crate::text_cleaner::clean_text_for_reading(&sec.content);
-            let sec_paras = split_text_paragraphs(&cleaned);
+            let blocks = if !sec.blocks.is_empty() {
+                sec.blocks
+            } else {
+                let cleaned = crate::text_cleaner::clean_text_for_reading(&sec.content);
+                split_text_paragraphs(&cleaned)
+                    .into_iter()
+                    .map(SectionBlock::Text)
+                    .collect()
+            };
 
-            for paragraph in sec_paras {
-                let words: Vec<&str> = paragraph.split_whitespace().collect();
-                if words.is_empty() {
-                    continue;
-                }
+            for block in blocks {
+                match block {
+                    SectionBlock::Text(paragraph_text) => {
+                        let words: Vec<&str> = paragraph_text.split_whitespace().collect();
+                        if words.is_empty() {
+                            continue;
+                        }
 
-                let para_start_word_idx = tokens.len();
-                let para_start_line_idx = lines.len();
-                let num_words = words.len();
-                let mut current_line_words = Vec::new();
-                let mut line_start_idx = tokens.len();
+                        let para_start_word_idx = tokens.len();
+                        let para_start_line_idx = lines.len();
+                        let num_words = words.len();
+                        let mut current_line_words = Vec::new();
+                        let mut line_start_idx = tokens.len();
 
-                for (i, &word) in words.iter().enumerate() {
-                    let is_last_word_of_p = i == num_words - 1;
-                    let token = Token::new(word, is_last_word_of_p);
-                    tokens.push(token);
-                    current_line_words.push(word);
+                        for (i, &word) in words.iter().enumerate() {
+                            let is_last_word_of_p = i == num_words - 1;
+                            let token = Token::new(word, is_last_word_of_p);
+                            tokens.push(token);
+                            current_line_words.push(word);
 
-                    let reached_chunk_size = current_line_words.len() >= words_per_line;
-                    let is_sentence_end = word.ends_with('.') || word.ends_with('!') || word.ends_with('?');
+                            let reached_chunk_size = current_line_words.len() >= words_per_line;
+                            let is_sentence_end = word.ends_with('.') || word.ends_with('!') || word.ends_with('?');
 
-                    let should_break_line = is_last_word_of_p
-                        || reached_chunk_size
-                        || (current_line_words.len() >= words_per_line.saturating_sub(2) && is_sentence_end);
+                            let should_break_line = is_last_word_of_p
+                                || reached_chunk_size
+                                || (current_line_words.len() >= words_per_line.saturating_sub(2) && is_sentence_end);
 
-                    if should_break_line {
-                        let line_end_idx = tokens.len();
-                        let line_text = current_line_words.join(" ");
-                        let pause_mult = if is_last_word_of_p {
-                            2.4
-                        } else if is_sentence_end {
-                            2.0
-                        } else if word.ends_with(',') || word.ends_with(';') {
-                            1.4
-                        } else {
-                            1.0
-                        };
+                            if should_break_line {
+                                let line_end_idx = tokens.len();
+                                let line_text = current_line_words.join(" ");
+                                let pause_mult = if is_last_word_of_p {
+                                    2.4
+                                } else if is_sentence_end {
+                                    2.0
+                                } else if word.ends_with(',') || word.ends_with(';') {
+                                    1.4
+                                } else {
+                                    1.0
+                                };
 
-                        let is_para_start = lines.len() == para_start_line_idx;
-                        lines.push(ReadingLine {
-                            text: line_text,
-                            word_indices: line_start_idx..line_end_idx,
-                            pause_multiplier: pause_mult,
-                            is_paragraph_start: is_para_start,
+                                let is_para_start = lines.len() == para_start_line_idx;
+                                lines.push(ReadingLine {
+                                    text: line_text,
+                                    word_indices: line_start_idx..line_end_idx,
+                                    pause_multiplier: pause_mult,
+                                    is_paragraph_start: is_para_start,
+                                });
+
+                                current_line_words.clear();
+                                line_start_idx = line_end_idx;
+                            }
+                        }
+
+                        let para_end_word_idx = tokens.len();
+                        let para_end_line_idx = lines.len();
+
+                        paragraphs.push(ReadingParagraph {
+                            text: paragraph_text,
+                            word_indices: para_start_word_idx..para_end_word_idx,
+                            line_indices: para_start_line_idx..para_end_line_idx,
+                            pause_multiplier: 1.15,
+                            table: None,
+                            image: None,
                         });
+                    }
+                    SectionBlock::Table(table) => {
+                        let table_text = table.to_text();
+                        let words: Vec<&str> = table_text.split_whitespace().collect();
+                        let para_start_word_idx = tokens.len();
+                        let para_start_line_idx = lines.len();
+                        let num_words = words.len();
+                        let mut current_line_words = Vec::new();
+                        let mut line_start_idx = tokens.len();
 
-                        current_line_words.clear();
-                        line_start_idx = line_end_idx;
+                        if num_words > 0 {
+                            for (i, &word) in words.iter().enumerate() {
+                                let is_last_word_of_p = i == num_words - 1;
+                                let token = Token::new(word, is_last_word_of_p);
+                                tokens.push(token);
+                                current_line_words.push(word);
+
+                                if is_last_word_of_p || current_line_words.len() >= words_per_line {
+                                    let line_end_idx = tokens.len();
+                                    let line_text = current_line_words.join(" ");
+                                    let is_para_start = lines.len() == para_start_line_idx;
+                                    lines.push(ReadingLine {
+                                        text: line_text,
+                                        word_indices: line_start_idx..line_end_idx,
+                                        pause_multiplier: 1.5,
+                                        is_paragraph_start: is_para_start,
+                                    });
+                                    current_line_words.clear();
+                                    line_start_idx = line_end_idx;
+                                }
+                            }
+                        } else {
+                            let token = Token::new("[Table]", true);
+                            tokens.push(token);
+                            lines.push(ReadingLine {
+                                text: "[Table]".to_string(),
+                                word_indices: para_start_word_idx..tokens.len(),
+                                pause_multiplier: 1.5,
+                                is_paragraph_start: true,
+                            });
+                        }
+
+                        let para_end_word_idx = tokens.len();
+                        let para_end_line_idx = lines.len();
+
+                        paragraphs.push(ReadingParagraph {
+                            text: table_text,
+                            word_indices: para_start_word_idx..para_end_word_idx,
+                            line_indices: para_start_line_idx..para_end_line_idx,
+                            pause_multiplier: 1.5,
+                            table: Some(table),
+                            image: None,
+                        });
+                    }
+                    SectionBlock::Image(image) => {
+                        let img_text = image.to_text();
+                        let words: Vec<&str> = img_text.split_whitespace().collect();
+                        let para_start_word_idx = tokens.len();
+                        let para_start_line_idx = lines.len();
+                        let num_words = words.len();
+                        let mut current_line_words = Vec::new();
+                        let mut line_start_idx = tokens.len();
+
+                        if num_words > 0 {
+                            for (i, &word) in words.iter().enumerate() {
+                                let is_last_word_of_p = i == num_words - 1;
+                                let token = Token::new(word, is_last_word_of_p);
+                                tokens.push(token);
+                                current_line_words.push(word);
+
+                                if is_last_word_of_p || current_line_words.len() >= words_per_line {
+                                    let line_end_idx = tokens.len();
+                                    let line_text = current_line_words.join(" ");
+                                    let is_para_start = lines.len() == para_start_line_idx;
+                                    lines.push(ReadingLine {
+                                        text: line_text,
+                                        word_indices: line_start_idx..line_end_idx,
+                                        pause_multiplier: 1.5,
+                                        is_paragraph_start: is_para_start,
+                                    });
+                                    current_line_words.clear();
+                                    line_start_idx = line_end_idx;
+                                }
+                            }
+                        } else {
+                            let token = Token::new("[Image]", true);
+                            tokens.push(token);
+                            lines.push(ReadingLine {
+                                text: "[Image]".to_string(),
+                                word_indices: para_start_word_idx..tokens.len(),
+                                pause_multiplier: 1.5,
+                                is_paragraph_start: true,
+                            });
+                        }
+
+                        let para_end_word_idx = tokens.len();
+                        let para_end_line_idx = lines.len();
+
+                        paragraphs.push(ReadingParagraph {
+                            text: img_text,
+                            word_indices: para_start_word_idx..para_end_word_idx,
+                            line_indices: para_start_line_idx..para_end_line_idx,
+                            pause_multiplier: 1.5,
+                            table: None,
+                            image: Some(image),
+                        });
                     }
                 }
-
-                let para_end_word_idx = tokens.len();
-                let para_end_line_idx = lines.len();
-
-                paragraphs.push(ReadingParagraph {
-                    text: words.join(" "),
-                    word_indices: para_start_word_idx..para_end_word_idx,
-                    line_indices: para_start_line_idx..para_end_line_idx,
-                    pause_multiplier: 1.15,
-                });
             }
 
             let word_count = tokens.len() - start_word_idx;
             let line_count = lines.len() - start_line_idx;
             let para_count = paragraphs.len() - start_para_idx;
 
-            if word_count > 0 {
+            if word_count > 0 || para_count > 0 {
                 sections.push(DocumentSection {
                     title: sec.title,
                     start_word_index: start_word_idx,
@@ -258,7 +476,7 @@ impl Document {
         let total_paragraphs = paragraphs.len();
 
         Self {
-            title,
+            title: parsed.title,
             file_path,
             tokens,
             lines,
@@ -267,14 +485,15 @@ impl Document {
             total_words,
             total_lines,
             total_paragraphs,
+            images: parsed.images,
         }
     }
 
     pub fn from_text(title: String, file_path: Option<PathBuf>, raw_text: &str, words_per_line: usize) -> Self {
-        let extracted = vec![ExtractedSection {
-            title: "Main Content".to_string(),
-            content: raw_text.to_string(),
-        }];
+        let extracted = vec![ExtractedSection::new(
+            "Main Content".to_string(),
+            raw_text.to_string(),
+        )];
         Self::from_sections(title, file_path, extracted, words_per_line)
     }
 
@@ -364,38 +583,38 @@ impl Document {
     pub fn demo_document(words_per_line: usize) -> Self {
         let title = "Speed Reader: The Distraction-Free Guide".to_string();
         let sections = vec![
-            ExtractedSection {
-                title: "Chapter 1: The Challenge of Wandering Attention".to_string(),
-                content: r#"Welcome to your new distraction-free speed reader.
+            ExtractedSection::new(
+                "Chapter 1: The Challenge of Wandering Attention".to_string(),
+                r#"Welcome to your new distraction-free speed reader.
 
 If you struggle with focus and find yourself reading the same sentence three times, this tool was built specifically for you.
 
 Traditional reading forces your eyes to jump back and forth across wide margins. Each jump is an opportunity for your mind to wander, get distracted, or lose track of where you were."#.to_string(),
-            },
-            ExtractedSection {
-                title: "Chapter 2: Line-by-Line & Paragraph Pacing".to_string(),
-                content: r#"With Line-by-Line mode, you see only one focused thought at a time. The world fades away, leaving just you and the active words.
+            ),
+            ExtractedSection::new(
+                "Chapter 2: Line-by-Line & Paragraph Pacing".to_string(),
+                r#"With Line-by-Line mode, you see only one focused thought at a time. The world fades away, leaving just you and the active words.
 
 With Paragraph mode, you absorb whole cohesive thoughts with elegant context above and below, pacing effortlessly through literature.
 
 Press M to toggle between Line, Paragraph, and RSVP modes anytime. Each line or paragraph pauses naturally according to punctuation and comprehension."#.to_string(),
-            },
-            ExtractedSection {
-                title: "Chapter 3: Optimal Recognition Points & RSVP".to_string(),
-                content: r#"With RSVP mode, words flash in the exact same spot at an adjustable pace.
+            ),
+            ExtractedSection::new(
+                "Chapter 3: Optimal Recognition Points & RSVP".to_string(),
+                r#"With RSVP mode, words flash in the exact same spot at an adjustable pace.
 
 An Optimal Recognition Point anchors your vision between vertical alignment ticks so your eyes never need to move.
 
 Take control of your pace. Press Space to play or pause. Use the Up and Down arrow keys to adjust your speed anytime."#.to_string(),
-            },
-            ExtractedSection {
-                title: "Chapter 4: Navigation, Bookmarks & Zen Focus".to_string(),
-                content: r#"Press F or F11 at any time to enter Zen Focus Mode. All buttons and bars vanish, leaving pure reading bliss.
+            ),
+            ExtractedSection::new(
+                "Chapter 4: Navigation, Bookmarks & Zen Focus".to_string(),
+                r#"Press F or F11 at any time to enter Zen Focus Mode. All buttons and bars vanish, leaving pure reading bliss.
 
 Use the chapter navigator to jump to any page or chapter instantly.
 
 Drop any PDF, EPUB, or TXT file into this window to begin your journey."#.to_string(),
-            },
+            ),
         ];
 
         Self::from_sections(title, None, sections, words_per_line)

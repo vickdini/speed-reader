@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReadingMode {
     Line,
+    Page,
     Paragraph,
     WordRsvp,
 }
@@ -26,6 +27,10 @@ impl AppTheme {
             Self::HighContrast => "High Contrast",
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +59,8 @@ pub struct AppConfig {
     pub smart_pause: bool,
     pub show_context_lines: bool,
     pub active_mode: ReadingMode,
+    #[serde(default = "default_true")]
+    pub epub_by_page: bool,
     pub recent_books: Vec<BookBookmark>,
 }
 
@@ -67,6 +74,7 @@ impl Default for AppConfig {
             smart_pause: true,
             show_context_lines: true,
             active_mode: ReadingMode::Line,
+            epub_by_page: true,
             recent_books: Vec::new(),
         }
     }

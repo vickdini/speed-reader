@@ -161,4 +161,153 @@ fn test_reading_mode_serialization() {
 
     let deserialized: ReadingMode = serde_json::from_str(&serialized).expect("deserialize");
     assert_eq!(deserialized, ReadingMode::Paragraph);
+
+    // Test Page mode serialization
+    let page_serialized = serde_json::to_string(&ReadingMode::Page).expect("serialize page");
+    assert_eq!(page_serialized, "\"Page\"");
+    let page_deserialized: ReadingMode = serde_json::from_str(&page_serialized).expect("deserialize page");
+    assert_eq!(page_deserialized, ReadingMode::Page);
 }
+
+#[test]
+fn test_epub_text_pagination_standard() {
+    use speed_reader::parser::epub::paginate_epub_text;
+
+    // Generate ~600 words across 4 paragraphs
+    let p1 = "Word ".repeat(150);
+    let p2 = "Term ".repeat(150);
+    let p3 = "Read ".repeat(150);
+    let p4 = "Book ".repeat(150);
+    let sample = format!("{}\n\n{}\n\n{}\n\n{}", p1, p2, p3, p4);
+
+    let (sections, next_page) = paginate_epub_text("Chapter 1: Beginnings", &sample, 1);
+
+    // Should break into multiple readable pages (each ~250-300 words)
+    assert!(sections.len() >= 2, "Expected at least 2 pages, got: {}", sections.len());
+    assert_eq!(next_page, sections.len() + 1);
+
+    // Verify all titles start with "Page " so section_type_label() identifies them as pages
+    for (i, sec) in sections.iter().enumerate() {
+        let expected_prefix = format!("Page {} — Chapter 1: Beginnings", i + 1);
+        assert_eq!(sec.title, expected_prefix);
+        assert!(!sec.content.is_empty());
+    }
+
+    // Verify Document created from these sections recognizes section_type_label as "Page"
+    let doc = Document::from_sections("EPUB Book".to_string(), None, sections, 8);
+    assert_eq!(doc.section_type_label(), "Page");
+}
+
+#[test]
+fn test_epub_text_pagination_with_explicit_pagebreaks() {
+    use speed_reader::parser::epub::paginate_epub_text;
+
+    let text_with_breaks = "First page content with enough words to read.\x0CSecond page after explicit break tag.\x0CThird page after another break.";
+    let (sections, _) = paginate_epub_text("Chapter 2", text_with_breaks, 1);
+
+    assert_eq!(sections.len(), 3);
+    assert_eq!(sections[0].title, "Page 1 — Chapter 2");
+    assert_eq!(sections[1].title, "Page 2 — Chapter 2");
+    assert_eq!(sections[2].title, "Page 3 — Chapter 2");
+}
+
+#[test]
+fn test_app_config_epub_by_page_default() {
+    use speed_reader::storage::AppConfig;
+
+    let cfg = AppConfig::default();
+    assert!(cfg.epub_by_page, "epub_by_page should be true by default");
+}
+
+#[test]
+fn test_innovator_solution_epub() {
+    let mut doc = epub::doc::EpubDoc::new("The Innovator's Solution.epub").unwrap();
+    let cover = doc.get_cover();
+    assert!(cover.is_some());
+    let (cover_bytes, cover_mime) = cover.unwrap();
+    println!("Cover size: {}, mime: {}", cover_bytes.len(), cover_mime);
+    assert!(!cover_bytes.is_empty());
+
+    let resource_ids: Vec<(String, std::path::PathBuf, String)> = doc.resources
+        .iter()
+        .map(|(id, res)| (id.clone(), res.path.clone(), res.mime.clone()))
+        .collect();
+    for (id, path, mime) in resource_ids {
+        println!("Res: {} -> {:?}, mime: {}", id, path, mime);
+        let bytes = doc.get_resource(&id);
+        println!("   loaded bytes: {:?}", bytes.as_ref().map(|b| b.0.len()));
+    }
+}
+
+#[test]
+fn test_image_texture_decode() {
+    let mut doc = epub::doc::EpubDoc::new("The Innovator's Solution.epub").unwrap();
+    let (cover_bytes, _) = doc.get_cover().unwrap();
+    let dynamic_img = image::load_from_memory(&cover_bytes).unwrap();
+    let rgba = dynamic_img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &rgba.into_raw());
+    assert_eq!(color_image.size, size);
+}
+
+#[test]
+fn test_innovator_solution_epub_tables_and_images() {
+    use speed_reader::parser::epub::extract_epub_sections_with_mode;
+    use std::path::Path;
+
+    let path = Path::new("The Innovator's Solution.epub");
+    assert!(path.exists());
+
+    let parsed = extract_epub_sections_with_mode(path, true).expect("Failed to extract EPUB");
+
+    // 1. Verify Cover image in images map and section
+    assert!(parsed.images.contains_key("cover"), "Cover image key should exist in images map");
+    assert!(parsed.images.contains_key("9781647826796.jpg"), "Cover image filename should exist in images map");
+
+    // First section should be Cover with an Image block
+    let first_sec = &parsed.sections[0];
+    assert!(first_sec.title.to_lowercase().contains("cover"), "First section should be Cover, got: {}", first_sec.title);
+    assert!(!first_sec.blocks.is_empty());
+    let has_cover_block = first_sec.blocks.iter().any(|b| matches!(b, speed_reader::reader::SectionBlock::Image(_)));
+    assert!(has_cover_block, "First section should contain an Image block");
+
+    // 2. Verify Table 1-1 in Chapter 1
+    let mut found_table_1_1 = false;
+    for sec in &parsed.sections {
+        for block in &sec.blocks {
+            if let speed_reader::reader::SectionBlock::Table(table) = block {
+                if let Some(ref cap) = table.caption {
+                    if cap.contains("TABLE 1-1") {
+                        found_table_1_1 = true;
+                        assert!(cap.contains("Portion of selected firms"), "Caption should contain title, got: {}", cap);
+                        assert_eq!(table.rows.len(), 19, "Table 1-1 should have 19 data rows");
+                        assert!(
+                            table.rows.iter().any(|r| r.iter().any(|c| c.contains("Dell Computer"))),
+                            "Table should contain Dell Computer row"
+                        );
+                        assert!(
+                            table.footer.as_ref().map(|f| f.contains("Deloitte Consulting")).unwrap_or(false),
+                            "Table should have Deloitte Consulting footer"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(found_table_1_1, "Should find Table 1-1 in parsed sections");
+
+    // 3. Build Document and verify paragraph structures
+    let doc = Document::from_parsed_document(parsed, Some(path.to_path_buf()), 8);
+    assert!(doc.total_paragraphs > 0);
+
+    // Verify Paragraph 0 is the cover image
+    let para0 = &doc.paragraphs[0];
+    assert!(para0.image.is_some(), "Paragraph 0 should have image metadata");
+
+    // Verify a paragraph contains Table 1-1
+    let table_para = doc.paragraphs.iter().find(|p| {
+        p.table.as_ref().map(|t| t.caption.as_deref().unwrap_or("").contains("TABLE 1-1")).unwrap_or(false)
+    });
+    assert!(table_para.is_some(), "Document paragraphs should contain Table 1-1");
+}
+

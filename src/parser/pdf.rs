@@ -1,6 +1,6 @@
 use std::path::Path;
 use lopdf::Document as LopdfDoc;
-use super::epub::ExtractedSection;
+use crate::reader::ExtractedSection;
 
 pub fn extract_pdf_sections(path: &Path) -> Result<(String, Vec<ExtractedSection>), String> {
     let title = path.file_stem()
@@ -27,14 +27,14 @@ pub fn extract_pdf_sections(path: &Path) -> Result<(String, Vec<ExtractedSection
                     format!("Page {}", page_num)
                 };
 
-                sections.push(ExtractedSection {
-                    title: title_label,
-                    content: if cleaned.trim().is_empty() {
+                sections.push(ExtractedSection::new(
+                    title_label,
+                    if cleaned.trim().is_empty() {
                         format!("[Page {} - Image / Blank Page]", page_num)
                     } else {
                         cleaned
                     },
-                });
+                ));
             }
 
             let has_content = sections.iter().any(|s| !s.content.starts_with("[Page "));
@@ -59,10 +59,10 @@ pub fn extract_pdf_sections(path: &Path) -> Result<(String, Vec<ExtractedSection
     for chunk in raw_pages {
         let cleaned = clean_pdf_text(chunk);
         if !cleaned.trim().is_empty() {
-            sections.push(ExtractedSection {
-                title: format!("Page {}", page_num),
-                content: cleaned,
-            });
+            sections.push(ExtractedSection::new(
+                format!("Page {}", page_num),
+                cleaned,
+            ));
             page_num += 1;
         }
     }
