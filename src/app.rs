@@ -402,6 +402,39 @@ impl SpeedReaderApp {
         }
     }
 
+    pub fn paragraph_line_step_forward(&mut self) {
+        if let Some(para) = self.current_paragraph().cloned() {
+            if self.line_index + 1 < para.line_indices.end {
+                self.line_index += 1;
+                self.word_index = self.document.word_for_line(self.line_index);
+            } else if self.paragraph_index + 1 < self.document.total_paragraphs {
+                self.paragraph_index += 1;
+                if let Some(next) = self.current_paragraph() {
+                    self.line_index = next.line_indices.start;
+                    self.word_index = self.document.word_for_line(self.line_index);
+                }
+            } else {
+                self.is_playing = false;
+                self.set_status("Reached end of book");
+            }
+        }
+    }
+
+    pub fn paragraph_line_step_backward(&mut self) {
+        if let Some(para) = self.current_paragraph().cloned() {
+            if self.line_index > para.line_indices.start {
+                self.line_index -= 1;
+                self.word_index = self.document.word_for_line(self.line_index);
+            } else if self.paragraph_index > 0 {
+                self.paragraph_index -= 1;
+                if let Some(prev) = self.current_paragraph() {
+                    self.line_index = prev.line_indices.end.saturating_sub(1);
+                    self.word_index = self.document.word_for_line(self.line_index);
+                }
+            }
+        }
+    }
+
     pub fn jump_steps(&mut self, count: isize) {
         match self.config.active_mode {
             ReadingMode::Line | ReadingMode::Page => {
@@ -644,11 +677,19 @@ impl eframe::App for SpeedReaderApp {
             self.scroll_accumulator += scroll_y;
             let threshold = 50.0;
             while self.scroll_accumulator <= -threshold {
-                self.step_forward();
+                if self.config.active_mode == ReadingMode::Paragraph {
+                    self.paragraph_line_step_forward();
+                } else {
+                    self.step_forward();
+                }
                 self.scroll_accumulator += threshold;
             }
             while self.scroll_accumulator >= threshold {
-                self.step_backward();
+                if self.config.active_mode == ReadingMode::Paragraph {
+                    self.paragraph_line_step_backward();
+                } else {
+                    self.step_backward();
+                }
                 self.scroll_accumulator -= threshold;
             }
         } else if self.last_scroll_time.elapsed().as_millis() > 180 {
@@ -677,6 +718,8 @@ impl eframe::App for SpeedReaderApp {
                 self.config.wpm = (self.config.wpm + 25).min(1200);
                 self.set_status(format!("Speed: {} WPM", self.config.wpm));
                 self.config.save();
+            } else if self.config.active_mode == ReadingMode::Paragraph {
+                self.paragraph_line_step_backward();
             } else {
                 self.step_backward();
             }
@@ -686,6 +729,8 @@ impl eframe::App for SpeedReaderApp {
                 self.config.wpm = self.config.wpm.saturating_sub(25).max(60);
                 self.set_status(format!("Speed: {} WPM", self.config.wpm));
                 self.config.save();
+            } else if self.config.active_mode == ReadingMode::Paragraph {
+                self.paragraph_line_step_forward();
             } else {
                 self.step_forward();
             }
@@ -1490,8 +1535,8 @@ impl SpeedReaderApp {
     }
 
     fn render_page_mode(&mut self, ui: &mut egui::Ui, rect: egui::Rect, center: egui::Pos2, colors: &ThemeColors) {
-        let card_width = (rect.width() * 0.90).clamp(520.0, 960.0);
-        let card_height = (rect.height() * 0.82).clamp(320.0, 760.0);
+        let card_width = (rect.width() * 0.92).clamp(520.0, 1020.0);
+        let card_height = (rect.height() * 0.82).clamp(340.0, 800.0);
         let card_rect = egui::Rect::from_center_size(center, vec2(card_width, card_height));
 
         // Soft accent glow around card
@@ -1530,8 +1575,12 @@ impl SpeedReaderApp {
         let line_count = cur_sec.map(|s| s.line_count).unwrap_or(self.document.lines.len());
         let end_line_idx = (start_line_idx + line_count).min(self.document.lines.len());
 
-        let line_font_size = (self.config.font_size * 0.52).clamp(16.0, 24.0);
-        let row_height = line_font_size * 1.6;
+        // Dynamic font size and line height so text fills the text window frame
+        let avail_inner_h = (card_rect.height() - 85.0).max(200.0);
+        let num_lines = (end_line_idx.saturating_sub(start_line_idx)).max(1);
+        let ideal_row_h = avail_inner_h / num_lines as f32;
+        let row_height = ideal_row_h.clamp(24.0, 48.0);
+        let line_font_size = (row_height * 0.58).clamp(15.0, 26.0);
 
         let mut clicked_line = None;
         let mut jump_prev_page = false;
@@ -1580,58 +1629,86 @@ impl SpeedReaderApp {
                 ui.separator();
                 ui.add_space(8.0);
 
-                // Page Lines with vertical scroll and line focus
+                // Page Content with vertical scroll and line focus
                 ScrollArea::vertical()
                     .id_salt("page_lines_scroll_area")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        let page_image = self.document.paragraphs.iter()
-                            .find(|p| p.image.is_some() && (start_line_idx..end_line_idx).any(|l| p.line_indices.contains(&l)))
-                            .and_then(|p| p.image.as_ref());
+                        let mut rendered_tables = std::collections::HashSet::new();
+                        let mut rendered_images = std::collections::HashSet::new();
 
-                        if let Some(img) = page_image {
-                            if end_line_idx.saturating_sub(start_line_idx) <= 4 {
-                                if let Some(texture) = Self::get_or_load_image_texture(
-                                    &mut self.image_textures,
-                                    ui.ctx(),
-                                    &self.document.images,
-                                    &img.image_id,
-                                ) {
-                                    let tex_size = texture.size_vec2();
-                                    let avail_w = ui.available_width().max(100.0);
-                                    let avail_h = (card_rect.height() - 100.0).max(150.0);
-                                    let max_w = (avail_w - 40.0).clamp(160.0, 520.0);
-                                    let max_h = (avail_h - 40.0).clamp(180.0, 540.0);
-                                    let scale = (max_w / tex_size.x).min(max_h / tex_size.y).min(1.0);
-                                    let display_size = tex_size * scale;
-
-                                    ui.vertical_centered(|ui| {
-                                        ui.add(
-                                            egui::Image::new(&texture)
-                                                .fit_to_exact_size(display_size)
-                                                .corner_radius(8),
-                                        );
-                                        ui.add_space(8.0);
-                                        let caption_text = img.caption.as_deref().or(img.alt.as_deref());
-                                        if let Some(caption) = caption_text {
-                                            ui.label(
-                                                RichText::new(caption)
-                                                    .color(colors.text_secondary)
-                                                    .italics()
-                                                    .size(12.0),
-                                            );
-                                        }
-                                    });
-                                    ui.add_space(10.0);
-                                }
-                            }
-                        }
-
-                        for idx in start_line_idx..end_line_idx {
+                        let mut idx = start_line_idx;
+                        while idx < end_line_idx {
                             if idx >= self.document.lines.len() {
                                 break;
                             }
+
+                            // Find paragraph containing this line
+                            let para = self.document.paragraphs.iter().find(|p| p.line_indices.contains(&idx));
+
+                            if let Some(p) = para {
+                                if let Some(ref table) = p.table {
+                                    if rendered_tables.insert(p.line_indices.start) {
+                                        let is_active_table = p.line_indices.contains(&self.line_index);
+                                        ui.add_space(6.0);
+
+                                        egui::Frame::canvas(ui.style())
+                                            .fill(if is_active_table { colors.accent.gamma_multiply(0.06) } else { colors.surface.gamma_multiply(0.5) })
+                                            .stroke(if is_active_table { Stroke::new(1.5_f32, colors.accent.gamma_multiply(0.6)) } else { Stroke::new(1.0_f32, colors.border) })
+                                            .corner_radius(CornerRadius::same(8))
+                                            .inner_margin(Margin::same(12))
+                                            .show(ui, |ui| {
+                                                Self::render_reading_table(ui, table, colors, "page_mode_table_grid");
+                                            });
+
+                                        ui.add_space(8.0);
+                                    }
+                                    idx = p.line_indices.end.max(idx + 1);
+                                    continue;
+                                } else if let Some(ref img) = p.image {
+                                    if rendered_images.insert(p.line_indices.start) {
+                                        if let Some(texture) = Self::get_or_load_image_texture(
+                                            &mut self.image_textures,
+                                            ui.ctx(),
+                                            &self.document.images,
+                                            &img.image_id,
+                                        ) {
+                                            let tex_size = texture.size_vec2();
+                                            let avail_w = ui.available_width().max(100.0);
+                                            let avail_h = (card_rect.height() - 100.0).max(150.0);
+                                            let max_w = (avail_w - 40.0).clamp(160.0, 520.0);
+                                            let max_h = (avail_h - 40.0).clamp(180.0, 540.0);
+                                            let scale = (max_w / tex_size.x).min(max_h / tex_size.y).min(1.0);
+                                            let display_size = tex_size * scale;
+
+                                            ui.vertical_centered(|ui| {
+                                                ui.add(
+                                                    egui::Image::new(&texture)
+                                                        .fit_to_exact_size(display_size)
+                                                        .corner_radius(8),
+                                                );
+                                                ui.add_space(8.0);
+                                                let caption_text = img.caption.as_deref().or(img.alt.as_deref());
+                                                if let Some(caption) = caption_text {
+                                                    ui.label(
+                                                        RichText::new(caption)
+                                                            .color(colors.text_secondary)
+                                                            .italics()
+                                                            .size(12.0),
+                                                    );
+                                                }
+                                            });
+                                            ui.add_space(10.0);
+                                        }
+                                    }
+                                    idx = p.line_indices.end.max(idx + 1);
+                                    continue;
+                                }
+                            }
+
+                            // Regular text line
                             let is_active = idx == self.line_index;
+                            let is_last_line = para.map(|p| idx + 1 == p.line_indices.end).unwrap_or(false);
                             let line = &self.document.lines[idx];
 
                             let (rect, resp) = ui.allocate_exact_size(
@@ -1673,11 +1750,6 @@ impl SpeedReaderApp {
                                 );
                             }
 
-                            let text_pos = egui::pos2(
-                                rect.left() + if is_active { 12.0 } else { 8.0 },
-                                rect.center().y,
-                            );
-
                             let text_color = if is_active {
                                 colors.text_primary
                             } else {
@@ -1690,21 +1762,17 @@ impl SpeedReaderApp {
                                 FontId::proportional(line_font_size)
                             };
 
-                            let display_line_text = if line.text.starts_with("[Illustration:") || line.text.starts_with("[Image:") {
-                                format!("🖼 {}", line.text)
-                            } else if line.text.starts_with("[Table") {
-                                format!("📊 {}", line.text)
-                            } else {
-                                line.text.clone()
-                            };
-
-                            ui.painter().text(
-                                text_pos,
-                                Align2::LEFT_CENTER,
-                                display_line_text,
+                            paint_justified_line(
+                                ui.painter(),
+                                rect,
+                                &line.text,
                                 font,
                                 text_color,
+                                is_last_line,
+                                if is_active { 12.0 } else { 8.0 },
                             );
+
+                            idx += 1;
                         }
                     });
             });
@@ -1738,54 +1806,124 @@ impl SpeedReaderApp {
         }
     }
 
-fn get_or_load_image_texture(
-    image_textures: &mut std::collections::HashMap<String, egui::TextureHandle>,
-    ctx: &egui::Context,
-    images: &std::collections::HashMap<String, Vec<u8>>,
-    image_id: &str,
-) -> Option<egui::TextureHandle> {
-    if let Some(tex) = image_textures.get(image_id) {
-        return Some(tex.clone());
-    }
+    fn render_reading_table(
+        ui: &mut egui::Ui,
+        table: &crate::reader::ReadingTable,
+        colors: &ThemeColors,
+        grid_id: &str,
+    ) {
+        ui.vertical(|ui| {
+            if let Some(ref cap) = table.caption {
+                ui.label(
+                    RichText::new(cap)
+                        .color(colors.accent)
+                        .strong()
+                        .size(15.0),
+                );
+                ui.add_space(8.0);
+            }
 
-    let bytes = images.get(image_id)
-        .or_else(|| {
-            let filename = std::path::Path::new(image_id)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(image_id);
-            images.get(filename)
-        })
-        .or_else(|| {
-            if image_id.to_lowercase().contains("cover") {
-                images.get("cover")
-            } else {
-                None
+            egui::Frame::canvas(ui.style())
+                .fill(colors.surface.gamma_multiply(0.7))
+                .stroke(Stroke::new(1.0_f32, colors.border))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::same(10))
+                .show(ui, |ui| {
+                    ScrollArea::horizontal()
+                        .id_salt(format!("{}_hscroll", grid_id))
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            egui::Grid::new(grid_id)
+                                .striped(true)
+                                .spacing(vec2(22.0, 10.0))
+                                .min_col_width(50.0)
+                                .show(ui, |ui| {
+                                    if !table.headers.is_empty() {
+                                        for h in &table.headers {
+                                            ui.label(
+                                                RichText::new(h)
+                                                    .color(colors.accent)
+                                                    .strong()
+                                                    .size(13.5),
+                                            );
+                                        }
+                                        ui.end_row();
+                                    }
+
+                                    for row in &table.rows {
+                                        for cell in row {
+                                            ui.label(
+                                                RichText::new(cell)
+                                                    .color(colors.text_primary)
+                                                    .size(13.0),
+                                            );
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                });
+
+            if let Some(ref foot) = table.footer {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(foot)
+                        .color(colors.text_faint)
+                        .italics()
+                        .size(12.0),
+                );
             }
         });
-
-    if let Some(raw_bytes) = bytes {
-        if let Ok(dyn_img) = image::load_from_memory(raw_bytes) {
-            let rgba = dyn_img.to_rgba8();
-            let size = [rgba.width() as usize, rgba.height() as usize];
-            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &rgba.into_raw());
-            let handle = ctx.load_texture(
-                format!("tex_{}", image_id),
-                color_image,
-                egui::TextureOptions::LINEAR,
-            );
-            image_textures.insert(image_id.to_string(), handle.clone());
-            return Some(handle);
-        }
     }
 
-    None
-}
+    fn get_or_load_image_texture(
+        image_textures: &mut std::collections::HashMap<String, egui::TextureHandle>,
+        ctx: &egui::Context,
+        images: &std::collections::HashMap<String, Vec<u8>>,
+        image_id: &str,
+    ) -> Option<egui::TextureHandle> {
+        if let Some(tex) = image_textures.get(image_id) {
+            return Some(tex.clone());
+        }
+
+        let bytes = images.get(image_id)
+            .or_else(|| {
+                let filename = std::path::Path::new(image_id)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(image_id);
+                images.get(filename)
+            })
+            .or_else(|| {
+                if image_id.to_lowercase().contains("cover") {
+                    images.get("cover")
+                } else {
+                    None
+                }
+            });
+
+        if let Some(raw_bytes) = bytes {
+            if let Ok(dyn_img) = image::load_from_memory(raw_bytes) {
+                let rgba = dyn_img.to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &rgba.into_raw());
+                let handle = ctx.load_texture(
+                    format!("tex_{}", image_id),
+                    color_image,
+                    egui::TextureOptions::LINEAR,
+                );
+                image_textures.insert(image_id.to_string(), handle.clone());
+                return Some(handle);
+            }
+        }
+
+        None
+    }
 
     fn render_paragraph_mode(&mut self, ui: &mut egui::Ui, rect: egui::Rect, center: egui::Pos2, colors: &ThemeColors) {
         // Responsive card dimensions
-        let card_width = (rect.width() * 0.88).clamp(500.0, 920.0);
-        let card_height = (rect.height() * 0.65).clamp(240.0, 560.0);
+        let card_width = (rect.width() * 0.90).clamp(500.0, 980.0);
+        let card_height = (rect.height() * 0.70).clamp(280.0, 680.0);
         let card_rect = egui::Rect::from_center_size(center, vec2(card_width, card_height));
 
         // Soft accent glow around card
@@ -1845,11 +1983,20 @@ fn get_or_load_image_texture(
             .unwrap_or_else(|| "Start".to_string());
 
         let current_para = self.current_paragraph().cloned();
+
+        // Ensure self.line_index is within current paragraph's line range
+        if let Some(ref p) = current_para {
+            if !p.line_indices.is_empty() && !p.line_indices.contains(&self.line_index) {
+                self.line_index = p.line_indices.start;
+                self.word_index = self.document.word_for_line(self.line_index);
+            }
+        }
+
         let is_table = current_para.as_ref().map(|p| p.table.is_some()).unwrap_or(false);
         let is_image = current_para.as_ref().map(|p| p.image.is_some()).unwrap_or(false);
         let cur_para_word_count = current_para.as_ref().map(|p| p.word_indices.end.saturating_sub(p.word_indices.start)).unwrap_or(0);
 
-        let para_font_size = (self.config.font_size * 0.65).clamp(18.0, 32.0);
+        let mut clicked_line = None;
 
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inner_rect), |ui| {
             ui.vertical(|ui| {
@@ -1890,73 +2037,17 @@ fn get_or_load_image_texture(
 
                 ui.add_space(8.0);
                 ui.separator();
-                ui.add_space(12.0);
+                ui.add_space(10.0);
 
-                // Paragraph Text Content with vertical scroll if long
+                // Paragraph Content
                 if let Some(para) = current_para {
                     if let Some(ref table) = para.table {
-                        // Render Structured Table
+                        // Render Structured Table matching Page mode
                         ScrollArea::both()
                             .id_salt("paragraph_table_scroll")
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                ui.vertical(|ui| {
-                                    if let Some(ref cap) = table.caption {
-                                        ui.label(
-                                            RichText::new(cap)
-                                                .color(colors.accent)
-                                                .strong()
-                                                .size(15.0),
-                                        );
-                                        ui.add_space(8.0);
-                                    }
-
-                                    egui::Frame::canvas(ui.style())
-                                        .fill(colors.surface.gamma_multiply(0.7))
-                                        .stroke(Stroke::new(1.0_f32, colors.border))
-                                        .corner_radius(CornerRadius::same(6))
-                                        .inner_margin(Margin::same(10))
-                                        .show(ui, |ui| {
-                                            egui::Grid::new("reading_table_grid")
-                                                .striped(true)
-                                                .spacing(vec2(22.0, 10.0))
-                                                .min_col_width(50.0)
-                                                .show(ui, |ui| {
-                                                    if !table.headers.is_empty() {
-                                                        for h in &table.headers {
-                                                            ui.label(
-                                                                RichText::new(h)
-                                                                    .color(colors.accent)
-                                                                    .strong()
-                                                                    .size(13.5),
-                                                            );
-                                                        }
-                                                        ui.end_row();
-                                                    }
-
-                                                    for row in &table.rows {
-                                                        for cell in row {
-                                                            ui.label(
-                                                                RichText::new(cell)
-                                                                    .color(colors.text_primary)
-                                                                    .size(13.0),
-                                                            );
-                                                        }
-                                                        ui.end_row();
-                                                    }
-                                                });
-                                        });
-
-                                    if let Some(ref foot) = table.footer {
-                                        ui.add_space(8.0);
-                                        ui.label(
-                                            RichText::new(foot)
-                                                .color(colors.text_faint)
-                                                .italics()
-                                                .size(12.0),
-                                        );
-                                    }
-                                });
+                                Self::render_reading_table(ui, table, colors, "paragraph_table_grid");
                             });
                     } else if let Some(ref img) = para.image {
                         // Render Image (Cover or In-Chapter Figure)
@@ -2009,16 +2100,87 @@ fn get_or_load_image_texture(
                                 });
                             });
                     } else {
-                        // Regular text paragraph
+                        // Regular text paragraph: render line by line with justified text and eye-friendly horizontal highlight bar
+                        let avail_inner_h = (card_rect.height() - 85.0).max(180.0);
+                        let num_lines = (para.line_indices.end.saturating_sub(para.line_indices.start)).max(1);
+                        let ideal_row_h = avail_inner_h / num_lines as f32;
+                        let row_height = ideal_row_h.clamp(28.0, 52.0);
+                        let line_font_size = (row_height * 0.56).clamp(16.0, 26.0);
+
                         ScrollArea::vertical()
-                            .id_salt("paragraph_scroll_area")
+                            .id_salt("paragraph_lines_scroll_area")
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                let rich_text = RichText::new(&para.text)
-                                    .size(para_font_size)
-                                    .color(colors.text_primary)
-                                    .line_height(Some(para_font_size * 1.55));
-                                ui.label(rich_text);
+                                for idx in para.line_indices.clone() {
+                                    if idx >= self.document.lines.len() {
+                                        break;
+                                    }
+                                    let is_active = idx == self.line_index;
+                                    let is_last_line = idx + 1 == para.line_indices.end;
+                                    let line = &self.document.lines[idx];
+
+                                    let (line_rect, resp) = ui.allocate_exact_size(
+                                        vec2(ui.available_width(), row_height),
+                                        egui::Sense::click(),
+                                    );
+
+                                    if resp.clicked() {
+                                        clicked_line = Some(idx);
+                                    }
+
+                                    if is_active {
+                                        resp.scroll_to_me(Some(Align::Center));
+
+                                        // Eye-friendly horizontal highlight bar in a shade that doesn't disturb the eyes
+                                        ui.painter().rect_filled(
+                                            line_rect,
+                                            CornerRadius::same(6),
+                                            colors.accent.gamma_multiply(0.12),
+                                        );
+                                        ui.painter().rect_stroke(
+                                            line_rect,
+                                            CornerRadius::same(6),
+                                            Stroke::new(1.0_f32, colors.accent.gamma_multiply(0.35)),
+                                            StrokeKind::Inside,
+                                        );
+
+                                        // Active line left pill marker
+                                        let pill = egui::Rect::from_min_max(
+                                            line_rect.left_top() + vec2(2.0, 3.0),
+                                            line_rect.left_bottom() + vec2(5.0, -3.0),
+                                        );
+                                        ui.painter().rect_filled(pill, CornerRadius::same(1), colors.accent);
+                                    } else if resp.hovered() {
+                                        ui.painter().rect_filled(
+                                            line_rect,
+                                            CornerRadius::same(6),
+                                            colors.text_faint.gamma_multiply(0.08),
+                                        );
+                                    }
+
+                                    let text_color = if is_active {
+                                        colors.text_primary
+                                    } else {
+                                        colors.text_secondary
+                                    };
+
+                                    let font = if is_active {
+                                        FontId::proportional(line_font_size + 0.5)
+                                    } else {
+                                        FontId::proportional(line_font_size)
+                                    };
+
+                                    // Render justified text
+                                    paint_justified_line(
+                                        ui.painter(),
+                                        line_rect,
+                                        &line.text,
+                                        font,
+                                        text_color,
+                                        is_last_line,
+                                        if is_active { 12.0 } else { 8.0 },
+                                    );
+                                }
                             });
                     }
                 } else {
@@ -2026,13 +2188,18 @@ fn get_or_load_image_texture(
                         ui.add_space(40.0);
                         ui.label(
                             RichText::new("Ready to read. Press Space to start.")
-                                .size(para_font_size * 0.8)
+                                .size(20.0)
                                 .color(colors.text_secondary),
                         );
                     });
                 }
             });
         });
+
+        if let Some(target) = clicked_line {
+            self.line_index = target;
+            self.word_index = self.document.word_for_line(target);
+        }
 
         // Reading playback progress indicator bar at bottom edge of card
         if self.is_playing {
@@ -2152,3 +2319,68 @@ fn truncate_str(s: &str, max_len: usize) -> String {
         format!("{}...", truncated)
     }
 }
+
+pub fn paint_justified_line(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    is_last_line: bool,
+    h_padding: f32,
+) {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return;
+    }
+
+    let left_x = rect.left() + h_padding;
+    let right_x = rect.right() - h_padding;
+    let avail_w = (right_x - left_x).max(10.0);
+
+    // If only one word or special block prefix, render left aligned
+    if words.len() == 1 || text.starts_with('[') {
+        let galley = painter.layout_no_wrap(text.to_string(), font, color);
+        let y = rect.center().y - (galley.size().y / 2.0);
+        painter.galley(egui::pos2(left_x, y), galley, color);
+        return;
+    }
+
+    // Measure each word galley
+    let galleys: Vec<_> = words
+        .iter()
+        .map(|w| painter.layout_no_wrap(w.to_string(), font.clone(), color))
+        .collect();
+
+    let total_words_w: f32 = galleys.iter().map(|g| g.size().x).sum();
+    let num_gaps = galleys.len().saturating_sub(1);
+
+    let space_galley = painter.layout_no_wrap(" ".to_string(), font.clone(), color);
+    let normal_space_w = space_galley.size().x;
+
+    let gap_from_justify = if num_gaps > 0 && avail_w > total_words_w {
+        (avail_w - total_words_w) / (num_gaps as f32)
+    } else {
+        normal_space_w
+    };
+
+    // Standard typesetting: do not stretch final line of paragraph or lines with excessive gaps
+    let justify = !is_last_line
+        && num_gaps > 0
+        && avail_w > total_words_w
+        && gap_from_justify <= normal_space_w * 3.5;
+
+    let gap_w = if justify {
+        gap_from_justify
+    } else {
+        normal_space_w
+    };
+
+    let mut cur_x = left_x;
+    for galley in galleys {
+        let y = rect.center().y - (galley.size().y / 2.0);
+        painter.galley(egui::pos2(cur_x, y), galley.clone(), color);
+        cur_x += galley.size().x + gap_w;
+    }
+}
+

@@ -311,3 +311,72 @@ fn test_innovator_solution_epub_tables_and_images() {
     assert!(table_para.is_some(), "Document paragraphs should contain Table 1-1");
 }
 
+#[test]
+fn test_paragraph_line_stepping() {
+    use speed_reader::app::SpeedReaderApp;
+    use speed_reader::storage::ReadingMode;
+
+    let p1 = "First line of words here for reading speed. Second line of words in the paragraph.";
+    let p2 = "Another paragraph with multiple lines. This is line two of the second paragraph.";
+    let sample = format!("{}\n\n{}", p1, p2);
+
+    let doc = Document::from_text("Test Stepping".to_string(), None, &sample, 6);
+    assert_eq!(doc.total_paragraphs, 2);
+    assert!(doc.paragraphs[0].line_indices.len() >= 2);
+
+    let mut app = SpeedReaderApp {
+        config: speed_reader::storage::AppConfig {
+            active_mode: ReadingMode::Paragraph,
+            ..Default::default()
+        },
+        document: doc,
+        word_index: 0,
+        line_index: 0,
+        paragraph_index: 0,
+        is_playing: false,
+        last_tick: std::time::Instant::now(),
+        step_duration_ms: 250.0,
+        zen_mode: false,
+        show_settings: false,
+        show_chapter_modal: false,
+        show_library_modal: false,
+        chapter_search_filter: String::new(),
+        page_jump_input: String::new(),
+        modal_error: None,
+        first_frame: false,
+        status_message: None,
+        scroll_accumulator: 0.0,
+        last_scroll_time: std::time::Instant::now(),
+        image_textures: std::collections::HashMap::new(),
+    };
+
+    // Step forward moves line by line within paragraph 0
+    let start_line = app.line_index;
+    app.paragraph_line_step_forward();
+    assert_eq!(app.paragraph_index, 0);
+    assert_eq!(app.line_index, start_line + 1);
+
+    // Step backward returns to previous line
+    app.paragraph_line_step_backward();
+    assert_eq!(app.paragraph_index, 0);
+    assert_eq!(app.line_index, start_line);
+
+    // Stepping to the end of paragraph 0 and one more advances to paragraph 1
+    let p0_end_line = app.document.paragraphs[0].line_indices.end;
+    while app.line_index + 1 < p0_end_line {
+        app.paragraph_line_step_forward();
+    }
+    assert_eq!(app.line_index, p0_end_line - 1);
+
+    // Step forward at boundary advances to paragraph 1 first line
+    app.paragraph_line_step_forward();
+    assert_eq!(app.paragraph_index, 1);
+    assert_eq!(app.line_index, app.document.paragraphs[1].line_indices.start);
+
+    // Step backward at boundary returns to paragraph 0 last line
+    app.paragraph_line_step_backward();
+    assert_eq!(app.paragraph_index, 0);
+    assert_eq!(app.line_index, p0_end_line - 1);
+}
+
+
